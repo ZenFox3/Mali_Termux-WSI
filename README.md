@@ -37,22 +37,21 @@ Repository layout:
 
     Xcb/Vulkan/        Vulkan loader, WSI, and shims
     Xcb/GL/            Desktop OpenGL, GLX, and EGL shims
+    Xcb/GLES/          GLES 1.x/2.x/3.x shim (zero-copy WSI)
+    Xcb/EGL/           EGL shim (X11/XCB/GBM platforms)
     Xcb/GL/GLFW/       Custom GLFW 3.6 implementation
     Xcb/GL/GLU/        Custom GLU 1.3 implementation
     Xcb/GL/GLUT/       Custom GLUT implementation
     Xcb/EGL/GBM/       GBM over AHardwareBuffer
     Xcb/drm/           Kernel-less DRM/KMS emulation
     Xcb/dri/           VA-API driver (MediaCodec backend)
-    Xcb/GLES/          GLES 1.x/2.x/3.x shim (zero-copy WSI)
-    Xcb/EGL/  EGL shim (X11/XCB/GBM platforms)
-    Xcb/EGL/Include/   Shared Mali SPHAL loader header
     src/               Bundled third-party code (libtess2, GLFW headers)
     makefile           Build orchestration
 
 ## Building
 
     make               # build everything into build/
-    make vulkan        # or: glfw, glu, glut, gles, drm, dri
+    make vulkan        # or: glfw, glu, glut, gles, drm, dri, egl
     make clean
 
 Run an application against the freshly built libraries:
