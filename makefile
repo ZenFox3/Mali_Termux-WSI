@@ -130,6 +130,8 @@ $(DRI_OUT): $(DRI_SRC) $(DRI_DEPS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DRI_CFLAGS) -shared $(DRI_SRC) -o $@ $(LDFLAGS) -ldl -lpthread -lnativewindow
 
+$(GLES_OUT): $(GLES_SRC) $(GLES_DEPS)
+	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(GLES_CFLAGS) -shared -Wl,-soname,libGLESv2.so.2 $< -o $@ $(LDFLAGS) $(GLES_LIBS)
 	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv2.so
 	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv3.so
