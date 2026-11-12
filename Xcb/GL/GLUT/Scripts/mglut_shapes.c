@@ -1,7 +1,7 @@
 /* GLUT primitives: cube, sphere, cone, torus, polyhedra. Only glBegin/glEnd + f-variants. */
 #include <math.h>
 #include <stdlib.h>
-#include "glut.h"
+#include <GL/glut.h>
 
 #define PI 3.14159265358979323846
 

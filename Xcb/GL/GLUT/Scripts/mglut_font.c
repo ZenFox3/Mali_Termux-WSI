@@ -1,5 +1,5 @@
 /* GLUT bitmap fonts (glutBitmapCharacter/Width/Length). Data in mglut_fontdata.h */
-#include "glut.h"
+#include <GL/glut.h>
 
 typedef struct {
   void **id; int h, desc;
@@ -14,6 +14,8 @@ void *glutBitmap9By15, *glutBitmap8By13, *glutBitmapTimesRoman10,
 #include "mglut_fontdata.h"
 
 static const BFont *findf(void *font){
+  uintptr_t k = (uintptr_t)font;           /* freeglut: constante 2..8 */
+  if (k >= 2 && k <= 8) return &BFONTS[k - 2];
   for(unsigned i=0;i<sizeof(BFONTS)/sizeof(BFONTS[0]);i++)
     if((void*)BFONTS[i].id==font) return &BFONTS[i];
   return 0;

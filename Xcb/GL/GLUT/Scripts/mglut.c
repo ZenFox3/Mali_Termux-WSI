@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/select.h>
-#include "glut.h"
+#include <GL/glut.h>
 
 static Display *dpy; static Window win; static GLXContext ctx; static int scr;
 static XVisualInfo *vinfo;

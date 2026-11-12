@@ -124,6 +124,176 @@ Adding on future supports for Wayland and Win32 (separated)
 
 ## OpenGL (`Xcb/GL`)
 
-- [ ] GLFW
-- [ ] GLU
-- [ ] GLUT 
+## GLFW (`Xcb/GL/GLFW`)
+
+A custom GLFW 3.6 implementation for Termux:X11 on Mali GPUs. It uses pure
+xcb (no Xlib), xkbcommon for keyboard input and EGL for contexts.
+
+### Layout
+
+- `Scripts/libglfw.c` – the whole library in one file
+- `src/glfw/include/` (repo root) – original GLFW 3.6 headers
+
+### Dependencies
+
+    pkg install clang make libxcb libxkbcommon libglvnd vulkan-headers
+
+The Termux GLFW package (older version) is not used: its header lacks
+constants this build needs, so the headers are bundled in `src/glfw`.
+
+### Build
+
+    make glfw              # build/libglfw.so.3
+    make clean
+
+### Usage
+
+    LD_LIBRARY_PATH=$PWD/build ./your_app
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `GLFW_SCALE=<float>` | Content scale reported to applications (default 1.0) |
+| `GLFW_DEBUG=1` | Log X errors |
+
+### How it works
+
+- **Window and input:** xcb windows, EWMH/ICCCM properties for title, size
+  hints, fullscreen, maximize and iconify. Key codes are evdev codes
+  (X keycode - 8) mapped to `GLFW_KEY_*`; text comes from xkbcommon
+  (xkbcommon-x11 when available, default keymap otherwise).
+- **Contexts:** EGL only. `GLFW_OPENGL_ES_API` gives ES 1/2/3.
+  `GLFW_OPENGL_API` binds the desktop API, which the EGL shim maps to ES.
+  The display comes from `eglGetPlatformDisplay(EGL_PLATFORM_XCB_EXT)`.
+- **Events:** `glfwWaitEvents` polls the xcb socket plus an internal pipe, so
+  `glfwPostEmptyEvent` can wake it from other threads.
+- **Cursor:** hidden, disabled (virtual cursor with pointer warp and grab)
+  and captured modes; standard cursor shapes from the X cursor font.
+- **Clipboard:** UTF-8 selection owner and requestor.
+- **Monitors:** RandR outputs and modes, with a single-screen fallback.
+- **Vulkan:** the loader is opened at runtime; surfaces use
+  `VK_KHR_surface` and `VK_KHR_xcb_surface`.
+
+### Limitations
+
+- Joysticks and gamepads, gamma ramps, custom cursors, drag and drop,
+  raw mouse motion and mouse passthrough are stubs that return the proper
+  GLFW error.
+- Only the X11 platform is available.
+- Framebuffer size equals window size (no HiDPI scaling).
+
+### Third-party code
+
+- `src/glfw` – GLFW headers, zlib/libpng license (see `src/glfw/LICENSE.md`).
+
+## GLU (`Xcb/GL/GLU`)
+
+A self-contained implementation of GLU 1.3 for Termux. It has no X11 or
+Mali-specific code and only needs an OpenGL library underneath.
+
+### Layout
+
+- `Scripts/glu.c` – matrices, quadrics, mipmaps, image scaling, error strings
+- `Scripts/glu_nurbs.c` – NURBS curves and surfaces
+- `Scripts/glu_tess.c` – polygon tessellator (wrapper over libtess2)
+- `src/libtess2/` (repo root) – bundled copy of libtess2, not available in Termux
+
+### Dependencies
+
+    pkg install clang make libglu
+
+`libglu` is only needed for the headers (`GL/gl.h`, `GL/glu.h`).
+
+### Build
+
+    make glu               # build/libGLU.so.1
+    make clean
+
+### Usage
+
+    LD_LIBRARY_PATH=$PWD/build ./your_app
+
+### How it works
+
+- **Projection and camera:** `gluPerspective`, `gluLookAt`, `gluProject`,
+  `gluUnProject` etc. are computed on the CPU and applied through
+  `glMultMatrixd`, so they work with any compatibility-profile GL.
+- **Quadrics:** spheres, cylinders and disks are emitted as triangle strips,
+  lines or points with `glBegin`/`glEnd`, with optional normals and texture
+  coordinates.
+- **Images and mipmaps:** only `GL_UNSIGNED_BYTE` is supported. Scaling uses
+  a box filter when shrinking and linear interpolation when enlarging.
+  1D/2D/3D mipmaps are uploaded level by level (3D uses
+  `glXGetProcAddressARB("glTexImage3D")`).
+- **NURBS:** B-spline evaluation on a sampled grid. In renderer mode it draws
+  directly with GL; in tessellator mode it calls the user callbacks.
+- **Tessellation:** contours are collected, passed to libtess2, and the
+  result is returned through the usual `GLU_TESS_*` callbacks as
+  `GL_TRIANGLES` (or `GL_LINE_LOOP` with `GLU_TESS_BOUNDARY_ONLY`).
+
+### Limitations
+
+- NURBS trimming (`gluBeginTrim`, `gluPwlCurve`) is not implemented.
+- NURBS sampling is parametric, not pixel-based, so `gluLoadSamplingMatrices`
+  has no effect.
+- The tessellator ignores `GLU_TESS_EDGE_FLAG` and always outputs triangles.
+- Image functions accept only `GL_UNSIGNED_BYTE`.
+
+### Third-party code
+
+- `src/libtess2` – libtess2, SGI Free Software License B (see
+  `src/libtess2/LICENSE.txt`).
+
+## GLUT (`Xcb/GL/GLUT`)
+
+A small GLUT implementation ("mglut") on top of Xlib and GLX. It runs on
+any X server (Termux:X11) with a GLX-capable `libGL`.
+
+### Layout
+
+- `Scripts/mglut.c` – window, GLX context, event loop, timers, input
+- `Scripts/mglut_shapes.c` – solid/wire cube, sphere, cone, torus, polyhedra
+- `Scripts/mglut_font.c` – bitmap fonts (`glutBitmapCharacter`, ...)
+- `Scripts/mglut_stubs.c` – unimplemented API (menus, overlays, ...)
+- `Include/mglut_fontdata.h` – generated glyph data
+
+### Dependencies
+
+    pkg install clang make freeglut libx11
+
+`freeglut` is only needed for the header (`GL/glut.h`).
+
+### Build
+
+    make glut              # build/libglut.so.3
+    make clean
+
+### Usage
+
+    LD_LIBRARY_PATH=$PWD/build ./your_app
+
+### How it works
+
+- **Window:** `glutCreateWindow` picks a GLX visual, trying progressively
+  weaker attributes (no stencil/accum, then no alpha, then minimal depth).
+- **Main loop:** pending X events are dispatched to the callbacks, then
+  timers, then the idle function, then the display callback. When there is
+  nothing to do it sleeps in `select()` until the next event or timer.
+- **Input:** key repeat can be filtered, special keys are translated to
+  `GLUT_KEY_*`, wheel buttons produce a down/up pair like FreeGLUT.
+- **Shapes:** generated with `glBegin`/`glEnd`; polyhedra are built at
+  runtime with outward-facing normals.
+- **Fonts:** 7 bitmap fonts rendered with `glBitmap` from embedded data.
+
+### Limitations
+
+- One window only; sub-windows are not supported.
+- Menus, overlays, color index, stroke fonts, spaceball, tablet, joystick
+  and video resize are stubs and do nothing.
+- Game mode is a plain fullscreen window.
+- Teapot, `glutSolidCylinder` and `glutBitmapString` are not implemented.
+
+### Work in progress
+
+EGL and GL is coming after fixed some issues found

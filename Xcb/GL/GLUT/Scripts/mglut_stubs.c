@@ -1,6 +1,6 @@
 /* GLUT functions declared in glut.h, but without real support here: they exist to prevent
    "undefined symbol" errors. They do NOT do anything useful (see comments). */
-#include "glut.h"
+#include <GL/glut.h>
 
 /* --- menus: unimplemented (created, but do not appear on screen) --- */
 static int menu_id=0;

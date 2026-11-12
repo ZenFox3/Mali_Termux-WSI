@@ -16,7 +16,7 @@
 #define _GNU_SOURCE
 #define _GLFW_BUILD_DLL
 #define GLFW_INCLUDE_NONE
-#include <glfw3.h>
+#include <GLFW/glfw3.h>
 
 #include <stdio.h>
 #include <stdlib.h>
