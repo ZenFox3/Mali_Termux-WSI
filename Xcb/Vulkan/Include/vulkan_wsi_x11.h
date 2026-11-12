@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <xcb/xcb.h>
+#include <xcb/xcbext.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
 #include <android/hardware_buffer.h>
@@ -49,9 +50,14 @@
 #endif
 
 #define WSI_MAX_IMG 8
+#define WSI_MAX_LY  8
 
 #ifndef AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
+#endif
+
+#ifndef AHARDWAREBUFFER_USAGE_VENDOR_3
+#define AHARDWAREBUFFER_USAGE_VENDOR_3 (1ULL << 51)
 #endif
 
 static const char* const wsi_dev_exts[] = {
