@@ -24,7 +24,7 @@ A zero-copy Window System Integration (WSI) layer that allows Desktop Linux appl
 
 ### Testes who helped
 
-Mosly those people was on Discord
+Mostly those people was on Discord
 
 * **Users and GPU:** (@saicharankandukuri) Zman tested with: **Mali-G72 Mali-G78**; @nonameforidea tested with: **Mali-G72**; (@bullymaguire0024) BullyMaguire tested with: **Mali-G77 MC9**
 
