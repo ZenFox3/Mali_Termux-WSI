@@ -2,6 +2,32 @@
 
 Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+### More info
+
+A zero-copy Window System Integration (WSI) layer that allows Desktop Linux applications (X11, KDE, Minecraft, Firefox) to run natively on Android's proprietary ARM Mali GPU, **without root** and **without Mesa/Zink**.
+
+### Local Device
+
+* **Hardware:** Xiaomi 24040RN64Y (MediaTek, Mali-G52 MC2)
+* **OS:** Android 14 (Stock, no root, bootloader locked)
+* **Environment:** Termux (Bionic linker, no proot)
+* **GPU:** Mali-G52 MC2
+* **CPU:** MediaTek Helio G91 Ultra (MT6769G)
+
+### GPU Tested
+
+* **GPU:** Mali-G78, Mali-G72, Mali-G77
+
+### Testes who helped
+
+Mosly those people was on Discord
+
+* **Users and GPU:** (@saicharankandukuri) Zman tested with: **Mali-G72 Mali-G78**; @nonameforidea tested with: **Mali-G72**; (@bullymaguire0024) BullyMaguire tested with: **Mali-G77 MC9**
+
 ## Contents
 
 - [Overview](#overview)
@@ -23,7 +49,7 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 | Library | Path | Output | Summary |
 |---|---|---|---|
 | Vulkan | `Xcb/Vulkan` | `libvulkan.so.1` | Mali driver loader plus XCB WSI |
-| OpenGL | `Xcb/GL` | `libGL.so.1` | GLX 1.4 and desktop GL emulation over EGL |
+| OpenGL | `Xcb/GL` | `libGL.so.1` | GLX 1.4 over EGL, desktop GL 1.x–4.3 emulated on GLES |
 | GLFW | `Xcb/GL/GLFW` | `libglfw.so.3` | GLFW 3.6 on xcb + EGL |
 | GLU | `Xcb/GL/GLU` | `libGLU.so.1` | GLU 1.3, self-contained |
 | GLUT | `Xcb/GL/GLUT` | `libglut.so.3` | Small GLUT on Xlib + GLX |
@@ -32,6 +58,7 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 | VA-API | `Xcb/dri` | `ahb_drv_video.so` | Video decode via AMediaCodec |
 | GLES | `Xcb/GLES` | `libGLESv2.so.2` | GLES 1.x/2.0/3.x over the Mali blob, zero-copy AHB + DRI3 |
 | EGL | `Xcb/EGL` | `libEGL.so.1` | EGL over the Mali blob: X11, XCB, GBM, surfaceless; zero-copy AHB + DRI3 |
+
 
 Repository layout:
 
@@ -45,13 +72,13 @@ Repository layout:
     Xcb/EGL/GBM/       GBM over AHardwareBuffer
     Xcb/drm/           Kernel-less DRM/KMS emulation
     Xcb/dri/           VA-API driver (MediaCodec backend)
-    src/               Bundled third-party code (libtess2, GLFW headers)
+    src/               Bundled third-party code (libtess2, GLFW headers, bcdec)
     makefile           Build orchestration
 
 ## Building
 
     make               # build everything into build/
-    make vulkan        # or: glfw, glu, glut, gles, drm, dri, egl
+    make vulkan        # or: glfw, glu, glut, gles, drm, dri, egl, gl
     make clean
 
 Run an application against the freshly built libraries:
@@ -178,6 +205,109 @@ driver as the last link.
 - AArch64 only.
 - One instance and one device per process.
 
+## OpenGL
+
+Path: `Xcb/GL`
+
+A `libGL.so.1` that provides GLX 1.4 on top of the EGL shim and emulates
+desktop OpenGL (1.x up to 4.3 core/compat) over the GLES that Mali offers.
+It also exports all `gl*` functions (it embeds `libGLESv2_shim.c`).
+
+### Layout
+
+- `Scripts/glx_shim.c` – GLX API, contexts, drawables; the only translation
+  unit, it `#include`s all the other `.c` files
+- `Scripts/gl_compat.c` – GL 1.x over GLES 1.1: `glBegin/glEnd`, display
+  lists, `glRasterPos`/`glDrawPixels`/`glBitmap`
+- `Scripts/gl_es_emul.c` – version/extension strings, GLSL → GLSL ES
+  translation, S3TC/RGTC/BPTC decoding, 1D textures, misc. missing calls
+- `Scripts/gl_es_alias.c`, `Include/gl_alias.h` – ARB/EXT/OES/KHR aliases, DSA wrappers
+- `Scripts/gl_desktop_ext.c` – `glPolygonMode`, multi-draw, BGRA uploads
+- `Scripts/gl_dsb.c` – dual-source blending via `GL_ARM_shader_framebuffer_fetch`
+- `Scripts/gl_clipdist.c` – `gl_ClipDistance` emulation
+- `Scripts/gl_litfix.c` – int→float literal repair for GLSL ES
+- `Scripts/gl_drawlog.c`, `gl_atlasdump.c` – debugging tools
+- `Include/glx_autoes.h` – picks the ES version from the app's imports
+- `Scripts/gl_tex1d.c` – obsolete (superseded by `gl_es_emul.c`), not built
+
+### Dependencies
+
+    pkg install clang make libxcb libx11 libglvnd
+
+Also needs `src/bcdec` (bundled), `Xcb/GLES/Include/gles_list.h` and the EGL
+shim at runtime. `libX11` and `libX11-xcb` are loaded with `dlopen`.
+
+### Build
+
+    make gl                # build/libGL.so.1
+
+### Usage
+
+    LD_LIBRARY_PATH=$PWD/build ./your_app
+
+### ES version selection
+
+| Source (in priority order) | Result |
+|---|---|
+| `GLX_ES=1\|2\|3` | forced |
+| `GLX_GL` (e.g. `21`, `33`, `43`) | `<20` → ES1, `>=30` → ES3 |
+| `glXCreateContextAttribsARB` | ES profile, or major 1 → ES1, major ≥3 → ES3 |
+| Imported symbols of the app | fixed-function only → ES1, shaders → ES2/3 |
+| Fallback | ES2 (`GLX_DEFAULT_ES=3` for ES3) |
+
+Fixed-function applications run on ES1; shader applications on ES3, with
+the reported version up to GL 4.3.
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `GLX_ES`, `GLX_GL`, `GLX_DEFAULT_ES` | ES version / reported GL version (see above) |
+| `GLX_ARGB_VISUAL=0x..` | Visual id for 32-bit windows |
+| `GLX_FORCE_DEPTH24` | Always report 24-bit visuals |
+| `GLX_HIDE_EXT="A,B"` | Hide extensions from the application |
+| `GLX_NO_LITFIX=1` | Disable the int→float literal repair |
+| `GL_DEBUG=1` | Verbose logging (`MALI_DEBUG`, `EGL_DEBUG` also work) |
+| `GLX_DEBUG=1` | Log the auto ES detection |
+| `GLX_TRACE=1` | Log `glGetIntegerv`/`glGetStringi` queries on stdout |
+| `GLX_SHADER_DUMP=1` | Print shaders sent to Mali |
+| `GLX_DUMP_TEXT=1` | Save WebRender text shaders to `$TMPDIR` |
+| `GLX_DSB_DEBUG=1`, `GLX_DSB_TEST=1..5` | Dual-source blending debug / test modes |
+| `GLX_DRAWLOG=<n>\|text\|swap\|fb0` | Log unique draw-state signatures |
+| `GLX_SWAPDUMP=x,y,w,h`, `GLX_SWAPDUMP_CH=r\|g\|b` | ASCII dump of the framebuffer at swaps 6/20/60 |
+| `GLX_ATLAS_DUMP=<n>`, `GLX_ATLAS_TEX`, `GLX_ATLAS_WH` | ASCII dump of uploaded atlas glyphs |
+| `GLX_ERRLOG=1` | Log GL errors in texture uploads |
+| `GLX_FS_TEST`, `GLX_FS_DBG` | Fragment shader debug injection (WebRender text) |
+
+### How it works
+
+- **Contexts:** GLX contexts map to EGL ES contexts; drawables are windows
+  (EGL window surfaces), pbuffers, or pixmaps (pbuffer + `xcb_put_image`
+  on flush/swap).
+- **Fixed function:** `glBegin/glEnd` become client-side vertex arrays
+  (QUADS → triangles); display lists record and replay commands; `glDrawPixels`
+  and `glBitmap` are drawn with textured/solid quads.
+- **GLSL:** GLSL 1.10–4.30 is translated to GLSL ES 1.00 / 3.20; `sampler1D`,
+  `sampler2DRect`, `sampler1DArray`, `gl_ClipDistance` and dual-source
+  outputs are rewritten. Shaders that fail on int→float conversions are
+  recompiled with promoted literals.
+- **Textures:** S3TC, RGTC and BPTC are decoded on the CPU; ETC/EAC pass
+  through; `TEXTURE_1D` uses a height-1 2D texture.
+- **Queries:** `GL_VERSION`, extensions and many limits are spoofed;
+  `GLX_MESA_query_renderer` is probed from the driver.
+
+### Limitations
+
+- Needs an ES context underneath; fixed-function calls require ES1
+  (use `GLX_ES=1` if auto-detection fails).
+- Not recorded in display lists: `glDrawPixels`, `glBitmap`, vertex arrays.
+- No pixel transfer (scale/bias/map), no `GL_UNPACK_ROW_LENGTH` on ES1.
+- `glXUseXFont`, `glClampColor`, `glProvokingVertex(FIRST)`, secondary
+  color, fog coord, double attributes and conditional render are stubs.
+- Clip distances are always applied (ignores `glEnable(GL_CLIP_DISTANCEn)`).
+- `glPolygonMode` LINE/POINT only for triangles in emulated ES2/3 contexts.
+- Do not load this together with `libGLESv2.so.2` in the same process.
+  
 ## GLFW
 
 Path: `Xcb/GL/GLFW`
@@ -333,8 +463,7 @@ any X server (Termux:X11) with a GLX-capable `libGL`.
 ## Roadmap
 
 - Separate backends for Wayland and Win32.
-- Desktop GL support, once a few remaining driver/WSI issues are
-  resolved.
+- Refinement of the Desktop GL shim (fixing edge cases in complex GLSL shaders and depth buffer precision).
 
 ## Notes from Arm engineers
 
@@ -761,3 +890,6 @@ VA-API applications (mpv, ffmpeg, ...) use the phone's hardware decoder.
   `src/libtess2/LICENSE.txt`).
 - `src/glfw` – GLFW headers, zlib/libpng license (see
   `src/glfw/LICENSE.md`).
+- `src/bcdec` – [bcdec](https://github.com/iOrange/bcdec) by iOrange, BC1-BC7
+  texture decoder, used by the OpenGL shim for S3TC/RGTC/BPTC decoding.
+  Dual-licensed: MIT or Public Domain/Unlicense (see `src/bcdec/LICENSE`).

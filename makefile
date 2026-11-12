@@ -86,9 +86,20 @@ EGL_OUT    := $(BUILD)/libEGL.so.1
 EGL_CFLAGS := -I$(EGL_DIR)/Include
 EGL_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
 
-.PHONY: all vulkan glu glut glfw gbm drm dri gles egl clean
+# ---- GL ----
+GL_DIR    := Xcb/GL
+GL_SRC    := $(GL_DIR)/Scripts/glx_shim.c
+GL_DEPS   := $(wildcard $(GL_DIR)/Scripts/*) $(wildcard $(GL_DIR)/Include/*) \
+             $(GLES_DIR)/Scripts/libGLESv2_shim.c $(GLES_DEPS) src/bcdec/bcdec.h
+GL_OUT    := $(BUILD)/libGL.so.1
+GL_CFLAGS := -D_GNU_SOURCE -I$(GL_DIR)/Include -I$(GL_DIR)/Scripts \
+             -I$(GLES_DIR)/Scripts -I$(GLES_DIR)/Include -IXcb/EGL/Include \
+             -Isrc/bcdec -Wno-unused-function -Wno-misleading-indentation
+GL_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -lEGL -ldl -lpthread -lm
 
-all: vulkan glu glut glfw gbm
+.PHONY: all vulkan glu glut glfw gbm drm dri gles egl gl clean
+
+all: vulkan glu glut glfw gbm drm dri gles egl gl
 
 vulkan: $(VK_OUT)
 glu:    $(GLU_OUT)
@@ -98,7 +109,9 @@ gbm:    $(GBM_OUT)
 drm:    $(DRM_OUT)
 dri:    $(DRI_OUT)
 gles:   $(GLES_OUT)
-egl: $(EGL_OUT)
+egl:    $(EGL_OUT)
+gl:     $(GL_OUT)
+
 
 $(VK_OUT): $(VK_SRC) $(VK_DEPS)
 	@mkdir -p $(BUILD)
@@ -151,6 +164,11 @@ $(EGL_OUT): $(EGL_SRC) $(EGL_DEPS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(EGL_CFLAGS) -shared -Wl,-soname,libEGL.so.1 $< -o $@ $(LDFLAGS) $(EGL_LIBS)
 	ln -sf libEGL.so.1 $(BUILD)/libEGL.so
+
+$(GL_OUT): $(GL_SRC) $(GL_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(GL_CFLAGS) -shared -Wl,-soname,libGL.so.1 $< -o $@ $(LDFLAGS) $(GL_LIBS)
+	ln -sf libGL.so.1 $(BUILD)/libGL.so
   
 clean:
 	rm -rf $(BUILD)
