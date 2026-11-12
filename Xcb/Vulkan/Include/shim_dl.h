@@ -1,4 +1,5 @@
-/* Dynamic-loader indirection for the Mali shims.
+/* shim_dl.h
+ * Dynamic-loader indirection for the Mali shims.
  *  - bionic (Termux native): plain dlopen/dlsym/dlerror.
  *  - glibc guest (-DSHIM_GLIBC): libhybris' hybris_dl* loads the Android HAL.
  *    libhybris-common must already be in the process (LD_PRELOAD from

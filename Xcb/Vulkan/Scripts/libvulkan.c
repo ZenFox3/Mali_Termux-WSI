@@ -1,12 +1,11 @@
-/* libvulkan.so.1 replacement: applications linking with -lvulkan find all symbols here.
+/* libvulkan.c
+libvulkan.so.1 replacement: applications linking with -lvulkan find all symbols here.
    Each Vulkan function is an aarch64 stub that jumps through a lookup table (signature-independent);
    the table is populated with real Mali driver (or WSI layer) function pointers
    after vkCreateInstance / vkCreateDevice. Single instance and single device per process.
 
    Steps:
      sh gen_shim.sh $PREFIX/include > vulkan_calls.inc
-     clang -O3 -shared -fPIC -DWSI_XLIB -o libvulkan.so.1 vulkan_shim.c \
-           -Wl,-soname,libvulkan.so.1 -ldl -lxcb -lxcb-dri3 -lxcb-present -lX11 -lX11-xcb
      LD_LIBRARY_PATH=<path_to_libvulkan.so.1> vulkaninfo --summary
    Without Xlib: remove -DWSI_XLIB, -lX11, -lX11-xcb.
    Env vars: MALI_ICD_LIB (driver path), WSI_CPU=1, WSI_SYNC=1, WSI_PRESENT=1. */

@@ -1,5 +1,5 @@
-#ifndef WSI_X11_H
-#define WSI_X11_H
+#ifndef VULKAN_WSI_X11_H
+#define VULKAN_WSI_X11_H
 
 /* Env vars (Debug & Override):
      VULKAN_DEBUG=1      enables verbose informational logging
@@ -257,8 +257,9 @@ static int wsi_clamp_features(VkPhysicalDeviceFeatures* req, const VkPhysicalDev
 }
 
 /* =====================  WSI LAYER CHAIN  ===================== */
-#define WSI_MAX_LY 16
-#define WSI_DEFAULT_LAYER_DIR "/data/data/com.termux/files/home/Mali_Desktop/Vulkan/Debug"
+#ifndef WSI_DEFAULT_LAYER_DIR
+#define WSI_DEFAULT_LAYER_DIR "/data/data/com.termux/files/home/Mali_Termux-WSI/Layers"
+#endif
 
 static struct {
     void* h; char name[VK_MAX_EXTENSION_NAME_SIZE];
