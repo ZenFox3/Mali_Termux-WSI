@@ -78,7 +78,15 @@ GLES_OUT    := $(BUILD)/libGLESv2.so.2
 GLES_CFLAGS := -I$(GLES_DIR)/Include -IXcb/EGL/Include
 GLES_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
 
-.PHONY: all vulkan glu glut glfw gbm drm dri gles clean
+# ---- EGL ----
+EGL_DIR    := Xcb/EGL
+EGL_SRC    := $(EGL_DIR)/Scripts/egl_x11_shim.c
+EGL_DEPS   := $(wildcard $(EGL_DIR)/Include/*)
+EGL_OUT    := $(BUILD)/libEGL.so.1
+EGL_CFLAGS := -I$(EGL_DIR)/Include
+EGL_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
+
+.PHONY: all vulkan glu glut glfw gbm drm dri gles egl clean
 
 all: vulkan glu glut glfw gbm
 
@@ -90,6 +98,7 @@ gbm:    $(GBM_OUT)
 drm:    $(DRM_OUT)
 dri:    $(DRI_OUT)
 gles:   $(GLES_OUT)
+egl: $(EGL_OUT)
 
 $(VK_OUT): $(VK_SRC) $(VK_DEPS)
 	@mkdir -p $(BUILD)
@@ -137,6 +146,11 @@ $(GLES_OUT): $(GLES_SRC) $(GLES_DEPS)
 	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv3.so
 	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv1_CM.so.1
 	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv1_CM.so
+
+$(EGL_OUT): $(EGL_SRC) $(EGL_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(EGL_CFLAGS) -shared -Wl,-soname,libEGL.so.1 $< -o $@ $(LDFLAGS) $(EGL_LIBS)
+	ln -sf libEGL.so.1 $(BUILD)/libEGL.so
   
 clean:
 	rm -rf $(BUILD)

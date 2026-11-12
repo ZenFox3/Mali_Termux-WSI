@@ -13,6 +13,7 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 - [GLUT](#glut)
 - [GBM](#gbm)
 - [GLES](#gles)
+- [EGL](#egl)
 - [DRM](#drm)
 - [VA-API driver](#va-api-driver)
 - [Roadmap](#roadmap)
@@ -30,6 +31,7 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 | DRM | `Xcb/drm` | `libdrm.so.2` | Kernel-less DRM/KMS emulation |
 | VA-API | `Xcb/dri` | `ahb_drv_video.so` | Video decode via AMediaCodec |
 | GLES | `Xcb/GLES` | `libGLESv2.so.2` | GLES 1.x/2.0/3.x over the Mali blob, zero-copy AHB + DRI3 |
+| EGL | `Xcb/EGL` | `libEGL.so.1` | EGL over the Mali blob: X11, XCB, GBM, surfaceless; zero-copy AHB + DRI3 |
 
 Repository layout:
 
@@ -42,6 +44,7 @@ Repository layout:
     Xcb/drm/           Kernel-less DRM/KMS emulation
     Xcb/dri/           VA-API driver (MediaCodec backend)
     Xcb/GLES/          GLES 1.x/2.x/3.x shim (zero-copy WSI)
+    Xcb/EGL/  EGL shim (X11/XCB/GBM platforms)
     Xcb/EGL/Include/   Shared Mali SPHAL loader header
     src/               Bundled third-party code (libtess2, GLFW headers)
     makefile           Build orchestration
@@ -331,7 +334,7 @@ any X server (Termux:X11) with a GLX-capable `libGL`.
 ## Roadmap
 
 - Separate backends for Wayland and Win32.
-- EGL and desktop GL support, once a few remaining driver/WSI issues are
+- Desktop GL support, once a few remaining driver/WSI issues are
   resolved.
 
 ## Notes from Arm engineers
@@ -538,6 +541,86 @@ and `libGLESv1_CM.so` are symlinks to it.
 - One context and one window per process.
 - The default framebuffer is emulated: its contents are the application's
   FBO, not a real window surface.
+
+## EGL
+
+Path: `Xcb/EGL`
+
+A `libEGL.so.1` that wraps the Mali blob and adds X11 window surfaces.
+Applications can create windows with Xlib or xcb, or render through GBM,
+without an EGL X11 platform in the driver.
+
+### Layout
+
+- `Scripts/egl_x11_shim.c` – EGL API, platforms, surfaces, zero-copy WSI
+- `Include/wsi_egl_x11.h` – fallback WSI (direct or blit-flip, ES1/2/3)
+- `Include/mali_sphal.h` – Mali driver loader
+- `Include/mali_native_fence.h` – native fence fd helper (`SHIM_SYNC=native`)
+
+### Dependencies
+
+    pkg install clang make libxcb vulkan-headers libglvnd
+
+### Build
+
+    make egl               # build/libEGL.so.1
+
+### Usage
+
+    LD_LIBRARY_PATH=$PWD/build ./your_app
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `EGL_DEBUG=1` | Verbose logging (`MALI_DEBUG`, `GL_DEBUG` also work) |
+| `SHIM_DMABUF=0` | Skip zero-copy, use the fallback WSI |
+| `SHIM_BUFFERS=<n>` | Number of presented buffers (default 4, max 8) |
+| `SHIM_MAILBOX=1` | Drop the frame when no buffer is free instead of waiting |
+| `SHIM_SYNC=finish\|flush\|implicit\|native` | Sync before Present (default: EGL fence) |
+| `SHIM_FORMAT=1\|5` | AHB format: 5 = BGRA, 1 = RGBA + swizzle |
+| `SHIM_IMPORT=native\|dmabuf` | Restrict the EGLImage import method |
+| `SHIM_AFBC=1` | Try an AFBC-compressed application texture |
+| `SHIM_PRESENT_COPY=1` | Present with the `COPY` option |
+| `SHIM_EVENT_THREAD=0` | No event thread (this also disables resize detection) |
+| `SHIM_OPAQUE=1` | Force alpha to 1 on 32-bit windows |
+| `SHIM_STATS=1` | Print frame statistics (with `EGL_DEBUG=1`) |
+| `SHIM_GBM=1` | `eglGetDisplay` returns the GBM platform display |
+| `SHIM_ES1=1` | Desktop GL requests create ES 1 contexts |
+| `WSI_NO_UPGRADE=1` | Do not upgrade ES2 contexts to ES3 |
+| `WSI_FPS`, `WSI_VSYNC`, `WSI_STATS` | Fallback WSI: frame cap, vsync gating, diagnostics |
+| `SHIM_DRM_PRIMARY`, `SHIM_DRM_RENDER`, `SHIM_LIBDRM` | DRM node names for the device extensions |
+
+### How it works
+
+- **Platforms:** `EGL_PLATFORM_X11_EXT`, `EGL_PLATFORM_XCB_EXT`,
+  `EGL_PLATFORM_GBM_KHR`, surfaceless and device. The Mali driver is
+  loaded lazily through SPHAL and every other call is forwarded to it.
+- **Window surfaces:** the application renders into an offscreen FBO.
+  On swap, a GPU pass flips Y (and swizzles if needed) into one of N
+  `AHardwareBuffer`s, which are shared as DRI3 pixmaps and EGLImages.
+  A worker thread waits for the fence and calls `xcb_present_pixmap`.
+  `PresentIdleNotify`, read on a separate xcb connection, frees buffers.
+- **Resize:** `ConfigureNotify` is handled on the event thread and the
+  buffers are rebuilt on the next swap.
+- **Fallback:** if zero-copy fails (or the context is not ES3), the
+  legacy WSI in `wsi_egl_x11.h` renders into a back FBO and flips it.
+- **Contexts:** ES2 contexts are upgraded to ES3 when possible.
+  `eglBindAPI(EGL_OPENGL_API)` is mapped to OpenGL ES.
+- **GBM:** surfaces created from `libgbm.so.1` (this project) are
+  rendered into the GBM buffer pool directly.
+- **Extensions:** adds or emulates `EGL_KHR_debug`, `EGL_EXT_sync_reuse`,
+  `EGL_MESA_drm_image`, `EGL_MESA_image_dma_buf_export`,
+  `EGL_EXT_device_*` and `EGL_KHR_swap_buffers_with_damage`.
+- **GLES shim:** `libGLESv2` detects `shim_x11_default_fbo` here and
+  switches its own WSI off.
+
+### Limitations
+
+- Pixmap surfaces are not supported.
+- One X connection and display per process.
+- Zero-copy requires GLES 3; GLES 1/2 contexts use the fallback WSI.
+- Up to 64 contexts and 4 initialized displays.
   
 ## DRM
 
