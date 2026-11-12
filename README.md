@@ -118,6 +118,10 @@ recreates the swapchain.
 `VK_LAYER_PATH` and chained using the loader-layer interface, with the
 driver as the last link.
 
+### Next?
+
+Adding on future supports for Wayland and Win32 (separated)
+
 ## OpenGL (`Xcb/GL`)
 
 - [ ] GLFW
