@@ -303,6 +303,8 @@ int glutExtensionSupported(const char *name) {
   return 0;
 }
 
+typedef void (*GLUTproc)(void);
+
 GLUTproc glutGetProcAddress(const char *name) {
   return (GLUTproc)dlsym(RTLD_DEFAULT, name);
 }
