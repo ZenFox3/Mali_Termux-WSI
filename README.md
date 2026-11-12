@@ -7,30 +7,40 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 - [Overview](#overview)
 - [Building](#building)
 - [Vulkan](#vulkan)
+- [OpenGL](#opengl)
 - [GLFW](#glfw)
 - [GLU](#glu)
 - [GLUT](#glut)
+- [GBM](#gbm)
+- [DRM](#drm)
+- [VA-API driver](#va-api-driver)
 - [Roadmap](#roadmap)
 - [Notes from Arm engineers](#notes-from-arm-engineers)
 - [Third-party code](#third-party-code)
 
-## Overview
-
 | Library | Path | Output | Summary |
 |---|---|---|---|
 | Vulkan | `Xcb/Vulkan` | `libvulkan.so.1` | Mali driver loader plus XCB WSI |
+| OpenGL | `Xcb/GL` | `libGL.so.1` | GLX 1.4 and desktop GL emulation over EGL |
 | GLFW | `Xcb/GL/GLFW` | `libglfw.so.3` | GLFW 3.6 on xcb + EGL |
 | GLU | `Xcb/GL/GLU` | `libGLU.so.1` | GLU 1.3, self-contained |
 | GLUT | `Xcb/GL/GLUT` | `libglut.so.3` | Small GLUT on Xlib + GLX |
+| GBM | `Xcb/EGL/GBM` | `libgbm.so.1` | GBM over AHardwareBuffer |
+| DRM | `Xcb/drm` | `libdrm.so.2` | Kernel-less DRM/KMS emulation |
+| VA-API | `Xcb/dri` | `ahb_drv_video.so` | Video decode via AMediaCodec |
 
 Repository layout:
 
-    Xcb/Vulkan/        Vulkan shim and WSI
-    Xcb/GL/GLFW/       GLFW
-    Xcb/GL/GLU/        GLU
-    Xcb/GL/GLUT/       GLUT
-    src/               bundled third-party code (libtess2, GLFW headers)
-    makefile
+    Xcb/Vulkan/        Vulkan loader, WSI, and shims
+    Xcb/GL/            Desktop OpenGL, GLX, and EGL shims
+    Xcb/GL/GLFW/       Custom GLFW 3.6 implementation
+    Xcb/GL/GLU/        Custom GLU 1.3 implementation
+    Xcb/GL/GLUT/       Custom GLUT implementation
+    Xcb/EGL/GBM/       GBM over AHardwareBuffer
+    Xcb/drm/           Kernel-less DRM/KMS emulation
+    Xcb/dri/           VA-API driver (MediaCodec backend)
+    src/               Bundled third-party code (libtess2, GLFW headers)
+    makefile           Build orchestration
 
 ## Building
 
