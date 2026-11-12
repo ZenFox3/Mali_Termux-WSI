@@ -70,7 +70,15 @@ DRI_DEPS   := $(wildcard $(DRI_DIR)/Include/*)
 DRI_OUT    := $(BUILD)/ahb_drv_video.so
 DRI_CFLAGS := -D_GNU_SOURCE -I$(DRI_DIR)/Include -I$(PREFIX)/include
 
-.PHONY: all vulkan glu glut glfw gbm drm dri clean
+# ---- GLES ----
+GLES_DIR    := Xcb/GLES
+GLES_SRC    := $(GLES_DIR)/Scripts/libGLESv2_shim.c
+GLES_DEPS   := $(wildcard $(GLES_DIR)/Include/*) $(wildcard Xcb/EGL/Include/*)
+GLES_OUT    := $(BUILD)/libGLESv2.so.2
+GLES_CFLAGS := -I$(GLES_DIR)/Include -IXcb/EGL/Include
+GLES_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
+
+.PHONY: all vulkan glu glut glfw gbm drm dri gles clean
 
 all: vulkan glu glut glfw gbm
 
@@ -81,6 +89,7 @@ glfw:   $(GLFW_OUT)
 gbm:    $(GBM_OUT)
 drm:    $(DRM_OUT)
 dri:    $(DRI_OUT)
+gles:   $(GLES_OUT)
 
 $(VK_OUT): $(VK_SRC) $(VK_DEPS)
 	@mkdir -p $(BUILD)
@@ -120,6 +129,12 @@ $(DRM_OUT): $(DRM_SRC)
 $(DRI_OUT): $(DRI_SRC) $(DRI_DEPS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DRI_CFLAGS) -shared $(DRI_SRC) -o $@ $(LDFLAGS) -ldl -lpthread -lnativewindow
+
+	$(CC) $(CFLAGS) $(GLES_CFLAGS) -shared -Wl,-soname,libGLESv2.so.2 $< -o $@ $(LDFLAGS) $(GLES_LIBS)
+	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv2.so
+	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv3.so
+	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv1_CM.so.1
+	ln -sf libGLESv2.so.2 $(BUILD)/libGLESv1_CM.so
   
 clean:
 	rm -rf $(BUILD)

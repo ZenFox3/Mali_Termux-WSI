@@ -12,6 +12,7 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 - [GLU](#glu)
 - [GLUT](#glut)
 - [GBM](#gbm)
+- [GLES](#gles)
 - [DRM](#drm)
 - [VA-API driver](#va-api-driver)
 - [Roadmap](#roadmap)
@@ -28,6 +29,7 @@ Window System Integration (XCB) for Mali GPUs on Termux (Termux:X11).
 | GBM | `Xcb/EGL/GBM` | `libgbm.so.1` | GBM over AHardwareBuffer |
 | DRM | `Xcb/drm` | `libdrm.so.2` | Kernel-less DRM/KMS emulation |
 | VA-API | `Xcb/dri` | `ahb_drv_video.so` | Video decode via AMediaCodec |
+| GLES | `Xcb/GLES` | `libGLESv2.so.2` | GLES 1.x/2.0/3.x over the Mali blob, zero-copy AHB + DRI3 |
 
 Repository layout:
 
@@ -39,13 +41,15 @@ Repository layout:
     Xcb/EGL/GBM/       GBM over AHardwareBuffer
     Xcb/drm/           Kernel-less DRM/KMS emulation
     Xcb/dri/           VA-API driver (MediaCodec backend)
+    Xcb/GLES/          GLES 1.x/2.x/3.x shim (zero-copy WSI)
+    Xcb/EGL/Include/   Shared Mali SPHAL loader header
     src/               Bundled third-party code (libtess2, GLFW headers)
     makefile           Build orchestration
 
 ## Building
 
     make               # build everything into build/
-    make vulkan        # or: glfw, glu, glut
+    make vulkan        # or: glfw, glu, glut, gles, drm, dri
     make clean
 
 Run an application against the freshly built libraries:
@@ -459,6 +463,82 @@ GBM run on the Mali blob.
 - Single plane formats only; no multi-planar or modifier negotiation.
 - Surfaces are not thread-safe.
 
+## GLES
+
+Path: `Xcb/GLES`
+
+A GLES 1.x / 2.0 / 3.x shim over the Mali blob. All GLES entry points are
+forwarded to the vendor driver; on top of that, a direct WSI presents the
+frames through DRI3/Present with no CPU copy.
+
+### Layout
+
+- `Scripts/libGLESv2_shim.c` – trampolines, WSI, swap logic
+- `Include/gles_list.h` – list of forwarded GLES functions
+- `Xcb/EGL/Include/mali_sphal.h` – Mali driver loader (shared with EGL)
+
+### Dependencies
+
+    pkg install clang make libxcb
+
+### Build
+
+    make gles              # build/libGLESv2.so.2
+
+One library is built; `libGLESv2.so`, `libGLESv3.so`, `libGLESv1_CM.so.1`
+and `libGLESv1_CM.so` are symlinks to it.
+
+### Usage
+
+    LD_LIBRARY_PATH=$PWD/build ./your_app
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `GL_DEBUG=1` | Verbose logging (`MALI_DEBUG` and `EGL_DEBUG` also work) |
+| `SHIM_DMABUF=0` | Disable the zero-copy WSI, use the original path |
+| `SHIM_SYNC=finish\|flush\|implicit` | Sync before Present (default: EGL fence; `implicit` uses `EGL_ARM_implicit_external_sync`) |
+| `SHIM_PRESENT_COPY=1` | Present with the `COPY` option |
+| `SHIM_FORMAT=1\|5` | Force AHB format: 5 = BGRA8888, 1 = RGBA8888 + swizzle |
+| `SHIM_W`, `SHIM_H` | Size of the window and buffers (default 1280x720) |
+| `SHIM_REAL_SWAP=1` | Also call the driver's real `eglSwapBuffers` |
+
+### How it works
+
+- **Forwarding:** every function in `gles_list.h` is an aarch64 trampoline
+  that jumps to the pointer resolved from the Mali driver at load time.
+  The driver is opened through SPHAL by a constructor.
+- **Offscreen rendering:** on first use the shim creates an offscreen FBO
+  (RGBA8 texture + depth/stencil). `glBindFramebuffer(0)` is redirected to
+  it, so the application renders there instead of to a window surface.
+- **Swap:** `eglSwapBuffers` runs a GPU pass that flips Y, swizzles if
+  needed and forces alpha to 1, writing into one of 3 buffers.
+- **Buffers:** each is an `AHardwareBuffer` with CPU_READ usage (linear,
+  no AFBC), imported twice: as an X pixmap (DRI3 `PixmapFromBuffer`) and as
+  an `EGLImage` bound to a texture. BGRA is tried first (native for X);
+  if it fails, RGBA with a swizzle in the blit shader.
+- **Present:** a worker thread waits on an EGL fence, then calls
+  `xcb_present_pixmap`. `PresentIdleNotify` marks a buffer free again; if
+  no event arrives within 300 ms, waiting is disabled automatically.
+- **Lazy init:** the WSI starts on the first `glBindFramebuffer(0)` or
+  `eglSwapBuffers` with a GLES 3 context. It saves and restores the GL
+  state it touches.
+- **EGL shim:** if the EGL shim from this project is loaded
+  (`shim_x11_default_fbo` found), the WSI in this library is disabled and
+  the EGL shim handles presentation.
+
+### Limitations
+
+- aarch64 only.
+- Zero-copy applies only to GLES 3 contexts; GLES 1/2 contexts use the
+  original driver path.
+- The shim creates its own X window of `SHIM_W` x `SHIM_H`; there is no
+  resize handling.
+- One context and one window per process.
+- The default framebuffer is emulated: its contents are the application's
+  FBO, not a real window surface.
+  
 ## DRM
 
 Path: `Xcb/drm`
