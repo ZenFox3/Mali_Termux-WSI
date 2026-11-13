@@ -55,6 +55,9 @@ typedef void (*F_teximg)(unsigned, int, int, int, int, int, unsigned, unsigned, 
 typedef void (*F_texenv)(unsigned, unsigned, float);
 typedef void (*F_texgeti)(unsigned, unsigned, int*);
 
+static void cc_note_front(unsigned m);
+static void cc_setfront(void);
+
 enum { OP_DRAW = 1, OP_NORMAL, OP_COLOR, OP_TEXCOORD, OP_MATERIAL, OP_SHADE, OP_FRONTFACE, OP_ENABLE,
        OP_DISABLE, OP_PUSH, OP_POP, OP_TRANSLATE, OP_ROTATE, OP_SCALE, OP_MULT, OP_IDENT, OP_LIGHT,
        OP_BINDTEX, OP_CALL, OP_WINDOWPOS, OP_RASTERPOS };
@@ -419,26 +422,30 @@ GLC void glLightf(unsigned light, unsigned pname, float v) {
     RP(FN, T)(VAL);
 
 GLC void glShadeModel(unsigned m) { REC1(OP_SHADE, glShadeModel, F_ui, m) }
-GLC void glFrontFace(unsigned m)  { REC1(OP_FRONTFACE, glFrontFace, F_ui, m) }
+GLC void glFrontFace(unsigned m) {
+    if (IM.rec_id) { gl_cmd* c = rec_cmd(OP_FRONTFACE); c->u[0] = m; if (REC_SKIP()) return; }
+    cc_note_front(m);
+    cc_setfront();
+}
 /* GL_TEXTURE_GEN_S/T/R (0x0C60..0x0C62) -> GL_TEXTURE_GEN_STR_OES (ES1 only; OES binds them together) */
 static unsigned gl_cap_xlat(unsigned cap) {
     return (cap >= 0x0C60 && cap <= 0x0C62 && T_glx.ctx && T_glx.ctx->ver == 1) ? 0x8D60 : cap;
 }
 
-/* Desktop capabilities absent in ES2/3: ignored (otherwise Mali raises GL_INVALID_ENUM).
-   Only in emulated contexts (neither ES1 nor native ES), where some of these are valid. */
+/* Capabilitati desktop inexistente in ES2/3: ignorate (altfel Mali da GL_INVALID_ENUM).
+   Doar in contexte emulate (nu ES1, nu ES nativ), unde unele dintre ele sunt valide. */
 static int gl_cap_ignored(unsigned cap) {
-    if (cap == 0x0DE0) return 1;                                   /* TEXTURE_1D (always) */
+    if (cap == 0x0DE0) return 1;                                   /* TEXTURE_1D (mereu) */
     if (!T_glx.ctx || T_glx.ctx->ver < 2 || T_glx.ctx->es_native) return 0;
     switch (cap) {
-    case 0x8F9D: case 0x8D69:                                      /* PRIMITIVE_RESTART (ES3: fixed index, always enabled) */
+    case 0x8F9D: case 0x8D69:                                      /* PRIMITIVE_RESTART (ES3: index fix, mereu activ) */
     case 0x8861: case 0x8642: case 0x864F: case 0x884F:            /* POINT_SPRITE, PROGRAM_POINT_SIZE, DEPTH_CLAMP, CUBE_MAP_SEAMLESS */
     case 0x809D: case 0x0B20: case 0x0B41: case 0x0BF2:            /* MULTISAMPLE, LINE_SMOOTH, POLYGON_SMOOTH, COLOR_LOGIC_OP */
     case 0x0DE1: case 0x8513:                                      /* TEXTURE_2D, TEXTURE_CUBE_MAP (legacy compat) */
     case 0x0B50: case 0x0BC0: case 0x0B60: case 0x0B57: case 0x0BA1: /* LIGHTING, ALPHA_TEST, FOG, COLOR_MATERIAL, NORMALIZE */
     case 0x0C60: case 0x0C61: case 0x0C62:                         /* TEXTURE_GEN_S/T/R */
-    case 0x8DB9:                                                   /* FRAMEBUFFER_SRGB */
-    case 0x0B10:                                                   /* POINT_SMOOTH */
+      case 0x8DB9:   /* FRAMEBUFFER_SRGB */
+case 0x0B10:   /* POINT_SMOOTH */
         return 1;
     }
     if ((cap >= 0x3000 && cap <= 0x3007) ||                        /* CLIP_DISTANCE0..7 */
@@ -446,7 +453,7 @@ static int gl_cap_ignored(unsigned cap) {
     return 0;
 }
 
-/* Forward declaration to notify the Dual-Source Blending module */
+/* Forward declaration pentru notificarea modulului Dual-Source Blending */
 static void dsb_on_enable(unsigned cap, int on);
 
 GLC void glEnable(unsigned cap) {
@@ -735,13 +742,13 @@ GLC void glDrawPixels(int w, int h, unsigned fmt, unsigned type, const void *px)
     if (was_fog)   RP(glEnable, F_ui)(0x0B60);
 }
 
-/* ---------- glBitmap (emulated): one quad per horizontal run of set pixels ---------- */
+/* ---------- glBitmap (emulat): cate un quad per serie orizontala de pixeli setati ---------- */
 static float bm_floor(float f) { int i = (int)f; return (float)(f < (float)i ? i - 1 : i); }
 
 GLC void glBitmap(int w, int h, float xorig, float yorig, float xmove, float ymove, const unsigned char* bm) {
     im_init();
     gl_warn_es("glBitmap");
-    if (IM.in_begin || IM.rec_id) return;              /* not recorded in display lists */
+    if (IM.in_begin || IM.rec_id) return;              /* nu se inregistreaza in display lists */
     if (!g_rvalid) return;
 
     if (w > 0 && h > 0 && bm) {
@@ -749,13 +756,13 @@ GLC void glBitmap(int w, int h, float xorig, float yorig, float xmove, float ymo
         if (al < 1) al = 4;
         int stride = ((((w + 7) / 8) + al - 1) / al) * al;
         size_t maxq = (size_t)h * (size_t)((w + 1) / 2);
-        if (maxq > 16384) maxq = 16384;                               /* im_draw limit: 65536 vertices */
+        if (maxq > 16384) maxq = 16384;                               /* limita im_draw: 65536 varfuri */
         float* v = malloc(maxq * 12 * sizeof(float));
         size_t nq = 0;
         float bx = bm_floor(g_rasterx - xorig), by = bm_floor(g_rastery - yorig);
 
         for (int r = 0; r < h && v; r++) {
-            const unsigned char* row = bm + (size_t)r * stride;       /* rows are bottom-to-top */
+            const unsigned char* row = bm + (size_t)r * stride;       /* randurile sunt de jos in sus */
             int x = 0;
             while (x < w) {
                 if (!((row[x >> 3] >> (7 - (x & 7))) & 1)) { x++; continue; }
@@ -791,7 +798,7 @@ GLC void glBitmap(int w, int h, float xorig, float yorig, float xmove, float ymo
             RP(glMatrixMode, F_ui)(0x1700);                           /* MODELVIEW */
             RP(glPushMatrix, F_v)(); RP(glLoadIdentity, F_v)();
 
-            im_draw(7, (int)(nq * 4), v, NULL, NULL, NULL);           /* GL_QUADS -> triangles */
+            im_draw(7, (int)(nq * 4), v, NULL, NULL, NULL);           /* GL_QUADS -> triunghiuri */
 
             RP(glPopMatrix, F_v)();
             RP(glMatrixMode, F_ui)(0x1701); RP(glPopMatrix, F_v)();
@@ -804,7 +811,7 @@ GLC void glBitmap(int w, int h, float xorig, float yorig, float xmove, float ymo
         }
         free(v);
     }
-    g_rasterx += xmove; g_rastery += ymove;                           /* raster advance, as in GL */
+    g_rasterx += xmove; g_rastery += ymove;                           /* avans raster, ca in GL */
 }
 /* ---------- Display Lists Execution ---------- */
 static void list_exec(unsigned id, int depth) {
@@ -820,7 +827,7 @@ static void list_exec(unsigned id, int depth) {
         case OP_MATERIAL:  RP(glMaterialfv, F_mat)(c->u[0], c->u[1], c->f); break;
         case OP_LIGHT:     RP(glLightfv, F_mat)(c->u[0], c->u[1], c->f); break;
         case OP_SHADE:     RP(glShadeModel, F_ui)(c->u[0]); break;
-        case OP_FRONTFACE: RP(glFrontFace, F_ui)(c->u[0]); break;
+        case OP_FRONTFACE: cc_note_front(c->u[0]); cc_setfront(); break;
         case OP_ENABLE:    RP(glEnable, F_ui)(c->u[0]);  dsb_on_enable(c->u[0], 1); break;
         case OP_DISABLE:   RP(glDisable, F_ui)(c->u[0]); dsb_on_enable(c->u[0], 0); break;
         case OP_BINDTEX:   RP(glBindTexture, F_uiui)(c->u[0], c->u[1]); break;
@@ -931,7 +938,7 @@ GLC void glGetDoublev(unsigned pname, double* out) {
 }
 
 /* ===== GL 1.3 / 1.4 fixed-function gaps ===== */
-/* MultiTexCoord: only unit 0 is recorded in glBegin/End; remaining units go directly to ES1 */
+/* MultiTexCoord: doar unitatea 0 se înregistrează în glBegin/End; restul merg direct la ES1 */
 GLC void glMultiTexCoord2f(unsigned t, float s, float v) {
     if (t == 0x84C0) { glTexCoord2f(s, v); return; }
     RP(glMultiTexCoord4f, F_utex)(t, s, v, 0.0f, 1.0f);
@@ -970,7 +977,7 @@ GLC void glMultiTexCoord2sv(unsigned t, const short* v) { glMultiTexCoord2f(t, v
 GLC void glMultiTexCoord3sv(unsigned t, const short* v) { glMultiTexCoord2f(t, v[0], v[1]); }
 GLC void glMultiTexCoord4sv(unsigned t, const short* v) { glMultiTexCoord2f(t, v[0], v[1]); }
 
-/* FogCoord / SecondaryColor: absent in ES1 -> ignored (rarely used) */
+/* FogCoord / SecondaryColor: ES1 nu le are -> ignorate (rar folosite) */
 GLC void glFogCoordf(float c)                  { (void)c; }
 GLC void glFogCoordd(double c)                 { (void)c; }
 GLC void glFogCoordfv(const float* c)          { (void)c; }
@@ -994,16 +1001,16 @@ GLC void glSecondaryColor3uiv(const unsigned* v)     { (void)v; }
 GLC void glSecondaryColor3usv(const unsigned short* v){ (void)v; }
 GLC void glSecondaryColorPointer(int s, unsigned t, int st, const void* p) { (void)s;(void)t;(void)st;(void)p; }
 
-/* PointParameter int: ES1 only has float */
+/* PointParameter int: ES1 are doar float */
 GLC void glPointParameteri(unsigned p, int v) {
     RP(glPointParameterf, F_uif)(p, (float)v);
 }
 GLC void glPointParameteriv(unsigned p, const int* v) {
     float f = (float)v[0];
-    RP(glPointParameterfv, F_clip)(p, &f);
+RP(glPointParameterfv, F_clip)(p, &f);
 }
 
-/* Transpose matrices: transpose on CPU, then Load/Mult */
+/* Transpose matrices: transpune pe CPU, apoi Load/Mult */
 static void tr16(const double* s, float* d) { for (int i=0;i<4;i++) for (int j=0;j<4;j++) d[i*4+j]=(float)s[j*4+i]; }
 static void tr16f(const float* s, float* d) { for (int i=0;i<4;i++) for (int j=0;j<4;j++) d[i*4+j]=s[j*4+i]; }
 GLC void glLoadTransposeMatrixf(const float* m)  { float t[16]; tr16f(m, t); RP(glLoadMatrixf, F_pf)(t); }

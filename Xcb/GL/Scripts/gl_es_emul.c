@@ -20,7 +20,7 @@
 #include <pthread.h>
 
 #define BCDEC_IMPLEMENTATION
-#include "bcdec.h"
+#include "../Include/bcdec.h"
 
 typedef const unsigned char* (*F_gstr)(unsigned);
 typedef void (*F_shsrc)(unsigned, int, const char* const*, const int*);
@@ -130,6 +130,7 @@ static const char* const emu_arb3[] = {
     "GL_EXT_texture_compression_s3tc_srgb", "GL_EXT_texture_compression_rgtc", "GL_ARB_texture_compression_rgtc",
     "GL_ARB_texture_compression_bptc", "GL_ATI_meminfo", "GL_NVX_gpu_memory_info",
     "GL_EXT_blend_func_extended",
+    "GL_ARB_clip_control", "GL_ARB_shader_draw_parameters",
     "GL_ARB_compute_shader", "GL_ARB_shader_storage_buffer_object", "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_atomic_counters", "GL_ARB_program_interface_query", "GL_ARB_explicit_uniform_location",
     "GL_ARB_vertex_attrib_binding", "GL_ARB_framebuffer_no_attachments", "GL_ARB_texture_storage_multisample",
@@ -503,6 +504,49 @@ static void ext_build(void) {
     pthread_mutex_unlock(&ext_mu);
 }
 
+/* ===== ARB_clip_control emulat (fără EXT_clip_control în Mali) ===== */
+typedef int  (*CC_gul)(unsigned, const char*);
+typedef void (*CC_u2f)(int, float, float);
+typedef struct { unsigned prog, ver; int loc; } cc_ent;
+#define CC_N 256
+static cc_ent   cc_tab[CC_N];
+static unsigned cc_prog, cc_ver;                  /* cc_ver == 0 -> nu s-a apelat niciodată */
+static unsigned cc_origin = 0x8CA1, cc_depth = 0x935E, cc_front = 0x0901;
+static int      cc_flip, cc_z01;
+
+static void cc_forget(unsigned p) { cc_ent* e = &cc_tab[p % CC_N]; if (e->prog == p) e->prog = 0; }
+
+static void cc_apply(void) {
+    if (!cc_prog || !cc_ver) return;
+    cc_ent* e = &cc_tab[cc_prog % CC_N];
+    if (e->prog != cc_prog) {
+        e->prog = cc_prog; e->ver = 0;
+        e->loc = RP(glGetUniformLocation, CC_gul)(cc_prog, "xl_clip");
+    }
+    if (e->loc >= 0 && e->ver != cc_ver) {
+        RP(glUniform2f, CC_u2f)(e->loc, cc_flip ? 1.f : 0.f, cc_z01 ? 1.f : 0.f);
+        e->ver = cc_ver;
+    }
+}
+
+static void cc_note_front(unsigned m) { cc_front = m; }
+
+static void cc_setfront(void) {
+    unsigned m = cc_front;
+    if (cc_flip) m = (m == 0x0900) ? 0x0901 : 0x0900;   /* flip Y inversează winding-ul */
+    RP(glFrontFace, F_ui)(m);
+}
+
+GLC void glClipControl(unsigned origin, unsigned depth) {
+    if ((origin != 0x8CA1 && origin != 0x8CA2) || (depth != 0x935E && depth != 0x935F)) return;
+    cc_origin = origin; cc_depth = depth;
+    cc_flip = (origin == 0x8CA2); cc_z01 = (depth == 0x935F);
+    cc_ver++;
+    cc_apply();
+    cc_setfront();
+}
+
+
 /* ===== C) Version and Extensions Query ===== */
 GLC const unsigned char* glGetString(unsigned name) {
     const unsigned char* r = RP(glGetString, F_gstr)(name);
@@ -594,7 +638,7 @@ GLC void glGetIntegerv(unsigned pname, int* v) {
             return;
         }
         
-        /* Desktop GL Fallback Mocks for Mali GLES */
+        /* Desktop GL Fallback Mocks foar Mali GLES */
         case 0x8824: *v = 16;     return; /* GL_MAX_VERTEX_ATTRIBS */
         case 0x88FF: *v = 36;     return; /* GL_MAX_UNIFORM_BUFFER_BINDINGS */
         case 0x8871: *v = 8;      return; /* GL_MAX_TEXTURE_COORDS */
@@ -602,7 +646,7 @@ GLC void glGetIntegerv(unsigned pname, int* v) {
         case 0x8B49: *v = 0x85B5; return; /* GL_FRAGMENT_SHADER_DERIVATIVE_HINT -> GL_DONT_CARE */
         case 0x8073: *v = 0;      return; /* GL_TEXTURE_COORD_ARRAY / Legacy state fallback */
 
-        /* New mocks for 0x8B4A and 0x8A2F */
+        /* Nije mocks foar 0x8B4A en 0x8A2F */
         case 0x8B4A: *v = 0x85B5; return; /* Derivative hint / Shader GLSL state fallback */
         case 0x8A2F: *v = 256;    return; /* GL_MAX_FRAGMENT_UNIFORM_VECTORS fallback */
         
@@ -625,6 +669,9 @@ GLC void glGetIntegerv(unsigned pname, int* v) {
         case 0x8872: *v = 16; return;
         case 0x8B4C: case 0x8B4D: *v = 4096; return;
         }
+        if (pname == 0x935C) { *v = (int)cc_origin; return; }
+        if (pname == 0x935D) { *v = (int)cc_depth;  return; }
+        if (pname == 0x0B46) { *v = (int)cc_front;  return; }   /* GL_FRONT_FACE, valoarea aplicației */
     } else if (ver == 2) {
         if (pname == 0x821B) { *v = 2; return; }
         if (pname == 0x821C) { *v = 1; return; }
@@ -1033,7 +1080,8 @@ static char* glsl_to_es(const char* src) {
     int leg1d = 0;
     char dn0[48] = {0}, dn1[48] = {0};
     int dsb = 0;
-
+    int cc = 0;
+  
     size_t blen = strlen(start);
     char* hdr  = malloc(blen + 64);
     char* body = malloc(blen + 1);
@@ -1079,13 +1127,18 @@ static char* glsl_to_es(const char* src) {
         gl_blank_word(body, bn, "noperspective");
         has1d = s1d_apply(body, bn);
         
-        /* Filter TEXTURE_RECT activation */
+        /* Filtrat activare TEXTURE_RECT */
         int rect_active = !strstr(start, "WR_FEATURE_TEXTURE_RECT") ||
                           strstr(start, "#define WR_FEATURE_TEXTURE_RECT");
         has2r = sx_apply(body, bn, sx_t2r, 3, sx_f2r, rect_active ? 3 : 0);
 
         has1a = sx_apply(body, bn, sx_t1a, 3, sx_f1a, 4);
         cd = cd_apply(body, bn);
+        if (!cd && !strstr(start, "#define WR_FRAGMENT_SHADER") &&
+            gl_word(body, bn, "gl_Position") && gl_word(body, bn, "main")) {
+            gl_rep_word(body, bn, "main", "xcc_");   /* "main" has 4 letters, same as "xcc_" */
+            cc = 1;
+        }
         int dsb_ok = !strstr(start, "#define WR_VERTEX_SHADER");
         if (dsb_ok && strstr(start, "WR_FEATURE_DUAL_SOURCE_BLENDING") &&
             !strstr(start, "#define WR_FEATURE_DUAL_SOURCE_BLENDING"))
@@ -1123,9 +1176,14 @@ static char* glsl_to_es(const char* src) {
         on += (size_t)sprintf(out + on, "#line 2\n");
     }
 
-    // --- Shader Patching Test (FS Debug Injection) ---
+    // --- Shader Patching Test (Injecție Debug FS) ---
     size_t body_start = on;
     memcpy(out + on, body, bn); on += bn; out[on] = 0;
+       if (cc) on += (size_t)sprintf(out + on,
+        "\nuniform vec2 xl_clip;\n"
+        "void main(){xcc_();"
+        "gl_Position.y*=1.0-2.0*xl_clip.x;"
+        "gl_Position.z+=xl_clip.y*(gl_Position.z-gl_Position.w);}\n");
     {
         const char* ft = getenv("GLX_FS_TEST");
         if (ft && !legacy && !dsb && !strstr(start, "#define WR_VERTEX_SHADER") && strstr(out, "COLOR_MODE_ALPHA")) {
@@ -1138,7 +1196,7 @@ static char* glsl_to_es(const char* src) {
             if (m == 1)      on += (size_t)sprintf(out + on, "vec4(fract(%s*64.0),0.0,1.0);}\n", uv);
             else if (m == 2) on += (size_t)sprintf(out + on, "vec4(vec3(texture(sColor0,clamp(%s,%s.xy,%s.zw)).r),1.0);}\n", uv, bd, bd);
             else             on += (size_t)sprintf(out + on, "vec4(vec3(texture(sColor0,%s).r),1.0);}\n", uv);
-            if (gl_emul_debug_enabled()) fprintf(stderr, "[fs-test] mode %d on text shader (%s,%s)\n", m, uv, bd);
+            if (gl_emul_debug_enabled()) fprintf(stderr, "[fs-test] mod %d pe shaderul de text (%s,%s)\n", m, uv, bd);
         }
     }
 
@@ -1146,7 +1204,7 @@ static char* glsl_to_es(const char* src) {
         on += dsb_emit(out + on, dn0, dn1);
     }
 
-    {   /* DEBUG: GLX_FS_DBG=1..5, only for ps_text_run (fragment) */
+    {   /* DEBUG: GLX_FS_DBG=1..5, doar pentru ps_text_run (fragment) */
         const char* dbg = getenv("GLX_FS_DBG");
         const char* pat = "frag.color = v_color * mask;";
         if (dbg && !legacy && strstr(start, "// shader: ps_text_run") && strstr(start, "#define WR_FRAGMENT_SHADER")) {
@@ -1162,7 +1220,7 @@ static char* glsl_to_es(const char* src) {
             if (at && on + rl + 64 < blen * 2 + 8000) {
                 memmove(at + rl, at + pl, strlen(at + pl) + 1);
                 memcpy(at, rep, rl);
-                fprintf(stderr, "[fs-dbg] mode %d applied on ps_text_run\n", m);
+                fprintf(stderr, "[fs-dbg] mod %d aplicat pe ps_text_run\n", m);
             }
         }
     }
@@ -1206,7 +1264,7 @@ GLC void glShaderSource(unsigned sh, int n, const char* const* str, const int* l
 
     const char* s = t ? t : j;
 
-    /* --- TEXT SHADER DUMP INJECTION (GLX_DUMP_TEXT) --- */
+    /* --- INJECȚIE DUMP SHADER DE TEXT (GLX_DUMP_TEXT) --- */
     if (getenv("GLX_DUMP_TEXT") && t && strstr(j, "COLOR_MODE_ALPHA") && strstr(j, "WR_FEATURE_ALPHA_PASS")) {
         const char* d = getenv("TMPDIR"); if (!d) d = ".";
         char fn[256];
@@ -1215,11 +1273,11 @@ GLC void glShaderSource(unsigned sh, int n, const char* const* str, const int* l
         if (f) {
             fputs("// ===== ORIGINAL =====\n", f);
             fputs(j, f);
-            fputs("\n// ===== TRANSLATED =====\n", f);
+            fputs("\n// ===== TRADUS =====\n", f);
             fputs(s, f);
             fclose(f);
             if (gl_emul_debug_enabled()) {
-                fprintf(stderr, "[dump-text] Saved text shader ID %u to %s\n", sh, fn);
+                fprintf(stderr, "[dump-text] Salvat shader text ID %u in %s\n", sh, fn);
             }
         }
     }
@@ -1233,8 +1291,11 @@ GLC void glShaderSource(unsigned sh, int n, const char* const* str, const int* l
 
 static void ad_install(void);
 
-GLC void glDeleteProgram(unsigned p) { dsb_on_delete(p); RP(glDeleteProgram, F_ui)(p); }
-GLC void glUseProgram(unsigned p) { ad_install(); dl_install(); RP(glUseProgram, F_ui)(p); dsb_on_use(p); }
+GLC void glDeleteProgram(unsigned p) { cc_forget(p); dsb_on_delete(p); RP(glDeleteProgram, F_ui)(p); }
+GLC void glUseProgram(unsigned p) {
+    cc_prog = p; ad_install(); dl_install();
+    RP(glUseProgram, F_ui)(p); dsb_on_use(p); cc_apply();
+}
 
 /* ===== F) Texture 1D Emulation & Buffer Reading Functions ===== */
 
@@ -1633,7 +1694,7 @@ GLC void glGetFramebufferAttachmentParameteriv(unsigned target, unsigned att,
     unsigned bq = (target == 0x8CA8) ? 0x8CAA : 0x8CA6;
     RP(glGetIntegerv, F_geti)(bq, &fb);
 
-    /* Application's FBO 0 = internal FBO of the EGL shim */
+    /* FBO 0 al aplicației = FBO intern al shim-ului EGL */
     unsigned def = shim_x11_default_fbo();
     int is_default = (!fb || (def && (unsigned)fb == def));
 
@@ -1769,7 +1830,7 @@ GLC void glBindImageTextures(unsigned first, int count, const unsigned* textures
     }
 }
 
-/* ===== Wrappers for glTexGen ===== */
+/* ===== Wrapper-e pentru glTexGen ===== */
 typedef void (*F_tgfv)(unsigned, unsigned, const float*);
 typedef void (*F_tgiv)(unsigned, unsigned, const int*);
 

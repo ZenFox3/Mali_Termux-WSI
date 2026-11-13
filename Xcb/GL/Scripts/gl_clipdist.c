@@ -152,5 +152,7 @@ GLC void glLinkProgram(unsigned prog) {
         if (gl_emul_debug_enabled()) fprintf(stderr, "[clipdist] program %u: %d clip distances emulated\n", prog, N);
     }
     RP(glLinkProgram, F_ui)(prog);
+    cc_forget(prog);
+    if (prog == cc_prog) cc_apply();
     dsb_on_link(prog);
 }
