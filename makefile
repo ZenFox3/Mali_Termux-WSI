@@ -85,11 +85,31 @@ GLES_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
 
 # ---- EGL ----
 EGL_DIR    := API/EGL
-EGL_SRC    := $(EGL_DIR)/Scripts/egl_x11_shim.c
+WL_GEN     := $(BUILD)/wayland
+SCANNER    ?= wayland-scanner
+WP := $(PREFIX)/share/wayland-protocols
+
+# name=xml  ->  $(WL_GEN)/<name>-client.h + <name>-protocol.c
+WL_CLIENT_PROTOS := \
+  linux-dmabuf=$(WP)/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+#  tearing-control=$(WP)/staging/tearing-control/tearing-control-v1.xml
+
+WL_CLIENT_NAMES := $(foreach p,$(WL_CLIENT_PROTOS),$(word 1,$(subst =, ,$(p))))
+
+EGL_GEN_C := $(foreach n,$(WL_CLIENT_NAMES),$(WL_GEN)/$(n)-protocol.c) \
+             $(WL_GEN)/wayland-drm-protocol.c
+EGL_GEN_H := $(foreach n,$(WL_CLIENT_NAMES),$(WL_GEN)/$(n)-client.h) \
+             $(WL_GEN)/wayland-drm-server-protocol.h
+DRM_XML    ?= src/mesa/src/egl/wayland/wayland-drm/wayland-drm.xml
+EGL_SRC    := $(EGL_DIR)/Scripts/egl_x11_shim.c \
+              $(EGL_DIR)/Scripts/wsi_wayland.c \
+              $(EGL_DIR)/Scripts/wl_server.c
+EGL_OBJ    := $(patsubst $(EGL_DIR)/Scripts/%.c,$(BUILD)/egl/%.o,$(EGL_SRC)) \
+              $(patsubst $(WL_GEN)/%.c,$(BUILD)/egl/%.o,$(EGL_GEN_C))
 EGL_DEPS   := $(wildcard $(EGL_DIR)/Include/*)
 EGL_OUT    := $(BUILD)/libEGL.so.1
-EGL_CFLAGS := -I$(EGL_DIR)/Include
-EGL_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
+EGL_CFLAGS := -I$(EGL_DIR)/Include -I$(WL_GEN) -I$(PREFIX)/include
+EGL_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -lwayland-client -lwayland-server -ldl -lpthread
 
 # ---- SPIRV-Cross (GL_ARB_gl_spirv, API/GL/Scripts/gl_spirv.c) ----
 # Static archives from the system package; the order does not matter (start-group)
@@ -118,9 +138,9 @@ GL_CXXFLAGS   := -std=c++17 -fvisibility=hidden -I$(GL_DIR)/Include \
 # SPV_LIBS comes before -lc++: the SPIRV-Cross archives need libc++ symbols
 GL_LIBS       := -lxcb -lxcb-dri3 -lxcb-present -lEGL $(SPV_LIBS) -ldl -lpthread -lm -lc++
 
-.PHONY: all vulkan glu glut glfw gbm drm dri gles egl gl clean
+.PHONY: all vulkan glu glut glfw gbm drm dri gles egl gl protocols clean
 
-all: vulkan gbm drm dri gles egl gl glu glut glfw
+all: vulkan gbm drm dri gles egl gl glu glut glfw protocols
 
 vulkan: $(VK_OUT)
 glu:    $(GLU_OUT)
@@ -132,6 +152,7 @@ dri:    $(DRI_OUT)
 gles:   $(GLES_OUT)
 egl:    $(EGL_OUT)
 gl:     $(GL_OUT)
+protocols: $(EGL_GEN_H) $(EGL_GEN_C)
 
 $(VK_OUT): $(VK_SRC) $(VK_DEPS)
 	@mkdir -p $(BUILD)
@@ -181,9 +202,40 @@ $(GLES_OUT): $(GLES_SRC) $(GLES_DEPS)
 	cp $(GLES_OUT) $(BUILD)/libGLESv1_CM.so.1
 	cp $(GLES_OUT) $(BUILD)/libGLESv1_CM.so
 
-$(EGL_OUT): $(EGL_SRC) $(EGL_DEPS)
+# ---- wayland-scanner: client protocols ----
+define WL_CLIENT_RULE
+$$(WL_GEN)/$(1)-client.h: $(2)
+	@mkdir -p $$(@D)
+	$$(SCANNER) client-header $$< $$@
+
+$$(WL_GEN)/$(1)-protocol.c: $(2)
+	@mkdir -p $$(@D)
+	$$(SCANNER) private-code $$< $$@
+endef
+
+$(foreach p,$(WL_CLIENT_PROTOS),\
+  $(eval $(call WL_CLIENT_RULE,$(word 1,$(subst =, ,$(p))),$(word 2,$(subst =, ,$(p))))))
+
+# ---- wayland-scanner: wl_drm (server) ----
+$(WL_GEN)/wayland-drm-server-protocol.h: $(DRM_XML)
+	@mkdir -p $(@D)
+	$(SCANNER) server-header $< $@
+
+$(WL_GEN)/wayland-drm-protocol.c: $(DRM_XML)
+	@mkdir -p $(@D)
+	$(SCANNER) private-code $< $@
+
+$(BUILD)/egl/%.o: $(EGL_DIR)/Scripts/%.c $(EGL_DEPS) | $(EGL_GEN_H)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(EGL_CFLAGS) -c $< -o $@
+
+$(BUILD)/egl/%.o: $(WL_GEN)/%.c | $(EGL_GEN_H)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(EGL_CFLAGS) -c $< -o $@
+
+$(EGL_OUT): $(EGL_OBJ)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(EGL_CFLAGS) -shared -Wl,-soname,libEGL.so.1 $< -o $@ $(LDFLAGS) $(EGL_LIBS)
+	$(CC) $(LDFLAGS) -shared -Wl,-soname,libEGL.so.1 $^ -o $@ $(EGL_LIBS)
 	cp $(EGL_OUT) $(BUILD)/libEGL.so
 
 $(GL_SHIM_OBJ): $(GL_SRC) $(GL_DEPS)

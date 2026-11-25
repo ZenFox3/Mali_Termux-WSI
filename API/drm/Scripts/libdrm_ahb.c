@@ -28,6 +28,7 @@
 #include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <inttypes.h>
 
 /* ---- Helper macro pentru dlsym ---- */
 #define REAL(ret, name, args) \
@@ -41,7 +42,7 @@ const void* AHardwareBuffer_getNativeHandle(const AHardwareBuffer* b);
 static int ahb_dmabuf_fd(AHardwareBuffer* ahb) {
     const nh_t* h = AHardwareBuffer_getNativeHandle(ahb);
     if (!h || h->numFds <= 1) return -1;
-    
+    /* Syscall direct pentru a evita deadlock/hook-uri la dup/fcntl */
     return (int)syscall(SYS_fcntl, h->data[1], F_DUPFD_CLOEXEC, 0);   /* data[1] = dmabuf on mobile GPUs */
 }
 
@@ -1126,6 +1127,38 @@ drmVersionPtr drmGetLibVersion(int fd) {
     v->version_major = 1; v->version_minor = 4; v->version_patchlevel = 0;
     return v;
 }
+
+char* drmGetFormatModifierName(uint64_t mod) {
+    if (mod == DRM_FORMAT_MOD_INVALID) return strdup("INVALID");
+    if (mod == DRM_FORMAT_MOD_LINEAR)  return strdup("LINEAR");
+    char* r = malloc(32);
+    if (r) snprintf(r, 32, "0x%016" PRIx64, mod);
+    return r;
+}
+
+char* drmGetFormatModifierVendor(uint64_t mod) {
+    switch (mod >> 56) {            /* fourcc_mod_get_vendor */
+    case DRM_FORMAT_MOD_VENDOR_NONE:     return strdup("NONE");
+    case DRM_FORMAT_MOD_VENDOR_INTEL:    return strdup("INTEL");
+    case DRM_FORMAT_MOD_VENDOR_AMD:      return strdup("AMD");
+    case DRM_FORMAT_MOD_VENDOR_NVIDIA:   return strdup("NVIDIA");
+    case DRM_FORMAT_MOD_VENDOR_ARM:      return strdup("ARM");
+    case DRM_FORMAT_MOD_VENDOR_QCOM:     return strdup("QCOM");
+    default:                             return NULL;
+    }
+}
+
+char* drmGetFormatName(uint32_t fmt) {
+    char* r = malloc(5);
+    if (!r) return NULL;
+    for (int i = 0; i < 4; i++) {
+        char c = (fmt >> (8 * i)) & 0xff;
+        r[i] = (c >= 32 && c < 127) ? c : '?';
+    }
+    r[4] = 0;
+    return r;
+}
+  
 int drmModeDirtyFB(int fd, uint32_t id, drmModeClipPtr c, uint32_t n) {
     (void)fd; (void)id; (void)c; (void)n; return 0;
 }

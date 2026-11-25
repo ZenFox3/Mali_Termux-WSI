@@ -11,10 +11,11 @@
  *
  */
 #define _GNU_SOURCE
-#include "wsi_egl_x11.h"
+#include "../Include/wsi_egl_x11.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
@@ -25,7 +26,9 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <sys/types.h>
-#include "mali_native_fence.h"
+#include "../Include/mali_native_fence.h"
+#include "wsi_wayland.h"
+#include "../Include/wl_server.h"
 #include <xcb/xcb.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
@@ -60,6 +63,7 @@
 #define EGL_PLATFORM_XCB_SCREEN_EXT   0x31DE
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
 #define EGL_PLATFORM_GBM_KHR          0x31D7
+#define EGL_PLATFORM_WAYLAND_KHR      0x31D8
 #define EGL_PLATFORM_DEVICE_EXT       0x313F
 #define EGL_DEVICE_EXT                0x322C
 #define EGL_RENDERER_EXT              0x335F
@@ -77,6 +81,8 @@
 
 #define MAX_BUFFERS 8
 #define GBM_MAX_SLOTS 6
+#define KIND_X11 0
+#define KIND_WL  1
 
 #define DBG(...) do { if (shim_debug_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -288,6 +294,8 @@ typedef struct shim_surf {
     int ev_active, ev_started, wake[2];
     pthread_t evth;
     int pend_w, pend_h;
+    int kind;                 /* KIND_X11 / KIND_WL */
+    void *wl, *wlwin;         /* wl_wsi*, wl_egl_window* */
 
     /* GBM path */
     int is_gbm, gbm_ok, gcur, ngsl;
@@ -300,6 +308,8 @@ static struct {
     pthread_mutex_t mu;
     int ready;
     void *mali, *dpy, *gdpy;
+    void *wdpy, *wl_native;
+    int own_wl, plat_wl;
     void* (*gpa)(const char*);
     xcb_connection_t* xc;
     int own_xc;
@@ -309,6 +319,7 @@ static struct {
     void* ctx[64];
     int ver[64];
     int rst[64];
+    int api[64];   /* 1 = ES, 2 = GL (emulated over ES) */
     void* gctx[64];
     int nctx;
     mali_fence_ctx_t fctx;
@@ -317,6 +328,7 @@ static struct {
 
 static __thread int T_err;
 static __thread shim_surf* T_surf;
+static __thread int T_cur_gl;   /* API of the current context */
 
 static inline shim_surf* cur_surf(void) {
     shim_surf* s = T_surf;
@@ -496,6 +508,16 @@ static int ctx_ver(void* ctx) {
     pthread_mutex_unlock(&G.mu);
     return v;
 }
+
+static int ctx_is_gl(void* ctx) {
+    int r = 0;
+    if (!ctx) return 0;
+    pthread_mutex_lock(&G.mu);
+    for (int i = 0; i < G.nctx; i++) if (G.ctx[i] == ctx) { r = G.api[i] == 2; break; }
+    pthread_mutex_unlock(&G.mu);
+    return r;
+}
+
 
 static void* glp(const char* n) {
     void* p = G.gpa ? G.gpa(n) : NULL;
@@ -762,9 +784,9 @@ static void surf_pacing_update(shim_surf* s) {
     if (!s->wsi) return;
     if (surf_use_async(s)) s->wsi->flags |= WSI_X11_ASYNC;
     else s->wsi->flags &= ~WSI_X11_ASYNC;
-}      
+}
 
-      static long stall_limit_us(void) {
+static long stall_limit_us(void) {
     static long v = -1;
     if (v < 0) {
         const char* e = getenv("SHIM_STALL_MS");
@@ -783,13 +805,13 @@ static void stall_check(shim_surf* s, long us, const char* what) {
         what, us / 1000, lim / 1000);
     surf_pacing_update(s);
 }
-      
+
 static void present_slot(shim_surf* s, int slot) {
     static int copy = -1;
     if (copy < 0) { const char* v = getenv("SHIM_PRESENT_COPY"); copy = v && atoi(v); }
     uint32_t opts = (surf_use_async(s) ? XCB_PRESENT_OPTION_ASYNC : 0) |
-                (copy ? XCB_PRESENT_OPTION_COPY : 0);
-    
+                    (copy ? XCB_PRESENT_OPTION_COPY : 0);
+
     if (shim_debug_enabled() && s->present_serial < 3) {
         xcb_void_cookie_t ck = xcb_present_pixmap_checked(G.xc, s->win, s->slots[slot].pixmap,
             ++s->present_serial, XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
@@ -802,6 +824,8 @@ static void present_slot(shim_surf* s, int slot) {
     }
     xcb_flush(G.xc);
 }
+
+#include "shim_wayland.inc"
 
 static void* present_worker(void* arg) {
     shim_surf* s = arg;
@@ -831,7 +855,8 @@ static void* present_worker(void* arg) {
             long tf = now_us() - tf0;
             stall_check(s, tf, "fence wait");
             s->t_pres[slot] = now_us();
-            present_slot(s, slot);
+            if (s->kind == KIND_WL) swl_present(s, slot);
+            else present_slot(s, slot);
 
             pthread_mutex_lock(&s->mu);
             s->st_fence += tf;
@@ -839,7 +864,7 @@ static void* present_worker(void* arg) {
             else if (s->slots[slot].busy) s->inflight++;
             continue;
         }
-        if (s->inflight > 0 && !s->no_idle && !s->ev_active) {
+        if (s->inflight > 0 && !s->no_idle && !s->ev_active && s->kind == KIND_X11) {
             struct timespec ts; ms_deadline(&ts, 1);
             pthread_cond_timedwait(&s->cv_job, &s->mu, &ts);
             if (s->qcount > 0 || s->stop) continue;
@@ -896,7 +921,9 @@ static int worker_start(shim_surf* s) {
         if (pthread_create(&s->evth, NULL, idle_thread, s)) { close(s->wake[0]); close(s->wake[1]); return -1; }
         s->ev_started = 1;
     }
+    if (s->kind == KIND_WL && s->wl && wl_wsi_start(s->wl)) return -1;
     if (pthread_create(&s->th, NULL, present_worker, s)) {
+        if (s->kind == KIND_WL && s->wl) wl_wsi_stop(s->wl);
         if (s->ev_started) {
             char c = 1; (void)!write(s->wake[1], &c, 1);
             pthread_join(s->evth, NULL);
@@ -916,6 +943,7 @@ static void worker_stop(shim_surf* s) {
     pthread_cond_broadcast(&s->cv_job);
     pthread_cond_broadcast(&s->cv_free);
     pthread_mutex_unlock(&s->mu);
+    if (s->kind == KIND_WL && s->wl) wl_wsi_stop(s->wl);   /* wakes present() and stops the event thread */
     pthread_join(s->th, NULL);
     if (s->ev_started) {
         char c = 1; (void)!write(s->wake[1], &c, 1);
@@ -989,10 +1017,14 @@ static void dmabuf_teardown(shim_surf* s, int with_gl) {
     }
     if (s->app_ab && ahb_release) { ahb_release(s->app_ab); s->app_ab = NULL; }
     for (int i = 0; i < s->nbuf; i++) slot_free(&s->slots[i], with_gl);
-    if (s->se && s->sec) { xcb_unregister_for_special_event(s->sec, s->se); s->se = NULL; }
-    if (s->ec) { xcb_disconnect(s->ec); s->ec = NULL; }
-    s->sec = NULL; s->ev_active = 0;
-    xcb_flush(G.xc);
+    if (s->kind == KIND_WL) {
+        swl_teardown(s);
+    } else {
+        if (s->se && s->sec) { xcb_unregister_for_special_event(s->sec, s->se); s->se = NULL; }
+        if (s->ec) { xcb_disconnect(s->ec); s->ec = NULL; }
+        s->sec = NULL; s->ev_active = 0;
+        xcb_flush(G.xc);
+    }
     s->app_fbo = s->app_tex = s->app_rbo = s->prog = s->vao = s->vbo = 0;
     s->dmabuf_inited = 0;
     s->current_slot = 0;
@@ -1146,7 +1178,7 @@ static int build_slot(shim_surf* s, int idx, int fmt, int verbose,
         return -1;
     }
     uint32_t stride = d.stride * 4;
-    if (stride == 0 || stride > 65535) {
+    if (stride == 0 || (s->kind == KIND_X11 && stride > 65535)) {
         if (verbose) DBG("[shim] dmabuf: stride %u bytes does not fit DRI3 1.0\n", stride);
         goto fail;
     }
@@ -1164,16 +1196,23 @@ static int build_slot(shim_surf* s, int idx, int fmt, int verbose,
 
     int dfd = dup(fd);
     if (dfd < 0) goto fail;
-    sl->pixmap = xcb_generate_id(G.xc);
-    xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffer_checked(
-        G.xc, sl->pixmap, s->win, size, s->w, s->h, (uint16_t)stride,
-        (uint8_t)(s->depth ? s->depth : 24), 32, dfd);
-    xcb_generic_error_t* err = xcb_request_check(G.xc, ck);
-    if (err) {
-        if (verbose)
-            DBG("[shim] dmabuf: DRI3 pixmap_from_buffer rejected (error %d, format %d)\n",
-                err->error_code, fmt);
-        free(err); sl->pixmap = 0; goto fail;
+    if (s->kind == KIND_WL) {
+        if (swl_create_buf(s, idx, dfd, s->w, s->h, stride)) {
+            if (verbose) DBG("[shim] dmabuf: wl_buffer creation failed (slot %d)\n", idx);
+            goto fail;
+        }
+    } else {
+        sl->pixmap = xcb_generate_id(G.xc);
+        xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffer_checked(
+            G.xc, sl->pixmap, s->win, size, s->w, s->h, (uint16_t)stride,
+            (uint8_t)(s->depth ? s->depth : 24), 32, dfd);
+        xcb_generic_error_t* err = xcb_request_check(G.xc, ck);
+        if (err) {
+            if (verbose)
+                DBG("[shim] dmabuf: DRI3 pixmap_from_buffer rejected (error %d, format %d)\n",
+                    err->error_code, fmt);
+            free(err); sl->pixmap = 0; goto fail;
+        }
     }
 
     sl->image = make_egl_image(sl->ab, get_cb, create_img, fd, s->w, s->h, stride, fmt, verbose);
@@ -1193,6 +1232,7 @@ static int build_slot(shim_surf* s, int idx, int fmt, int verbose,
     }
     return 0;
 fail:
+    if (s->kind == KIND_WL && s->wl) wl_wsi_free_buffer(s->wl, idx);
     slot_free(sl, 1);
     return -1;
 }
@@ -1327,7 +1367,7 @@ static int dmabuf_init(shim_surf* s, int ver) {
     if (s->w <= 0 || s->h <= 0) { DBG("[shim] dmabuf: invalid size %dx%d\n", s->w, s->h); return -1; }
     if (ahb_init()) return -1;
     if (gl_load()) return -1;
-    if (present_setup(s)) return -1;
+    if (s->kind == KIND_WL ? swl_setup(s) : present_setup(s)) return -1;
 
     gl_saved st;
     gl_save(&st);
@@ -1413,20 +1453,24 @@ static void dmabuf_swap(shim_surf* s) {
     static int stats = -1;
     if (stats < 0) { const char* v = getenv("SHIM_STATS"); stats = v && atoi(v); }
 
-    if (s->ev_active) {
+    if (s->ev_active || s->kind == KIND_WL) {
         int pw = __atomic_load_n(&s->pend_w, __ATOMIC_RELAXED);
         int ph = __atomic_load_n(&s->pend_h, __ATOMIC_RELAXED);
         if (pw > 0 && ph > 0 && (pw != s->w || ph != s->h)) {
-            dmabuf_resize(s, pw, ph);
-            return;
+            if (dmabuf_resize(s, pw, ph) < 0 || s->kind != KIND_WL) return;
         }
     }
 
     if (stats) s->st_app++;
 
     long ta0 = now_us();
+             if (s->kind == KIND_WL) {
+        wl_wsi_pump(s->wl, 0);                                   /* release + frame done */
+        if (!surf_use_async(s)) wl_wsi_wait_frame(s->wl, 100);   /* swap blochează până la frame done */
+             }
     int k;
     if (surf_use_mailbox(s)) {
+              if (s->kind == KIND_WL) wl_wsi_pump(s->wl, 0);
         pthread_mutex_lock(&s->mu);
         k = first_free(s);
         pthread_mutex_unlock(&s->mu);
@@ -1436,10 +1480,9 @@ static void dmabuf_swap(shim_surf* s) {
             return;
         }
         if (k < 0) k = s->current_slot;
-    } else k = acquire_slot(s);
+    } else k = (s->kind == KIND_WL) ? swl_acquire_slot(s) : acquire_slot(s);
     long ta1 = now_us();
     dmabuf_slot_t* sl = &s->slots[k];
-
 
     gl_saved st;
     gl_save(&st);
@@ -1613,7 +1656,7 @@ static void* make_gbm_surface(void* gs) {
     if (!s) { SET_ERR(E_BAD_ALLOC); return NULL; }
     s->magic = SURF_MAGIC; s->is_gbm = 1; s->gs = gs;
     s->w = (int)w; s->h = (int)h; s->interval = 1; s->gcur = -1;
-      s->dpy = G.gdpy;
+    s->dpy = G.gdpy;
     pthread_mutex_lock(&G.mu);
     s->next = G.surfs; G.surfs = s;
     pthread_mutex_unlock(&G.mu);
@@ -1688,7 +1731,7 @@ static void* make_window_surface(void* d, uint32_t win) {
     s->magic = SURF_MAGIC; s->win = win; s->w = g->width; s->h = g->height;
     s->x = g->x; s->y = g->y; s->bw = g->border_width; s->depth = g->depth;
     s->interval = 1;
-            s->dpy = d;
+    s->dpy = d;
     free(g);
     pthread_mutex_lock(&G.mu);
     s->next = G.surfs; G.surfs = s;
@@ -1714,6 +1757,17 @@ static void send_configure(shim_surf* s) {
 static int surf_attach(shim_surf* s, void* ctx) {
     int ver = ctx_ver(ctx);
     if (s->is_gbm) return gbm_attach(s, ctx);
+
+    if (s->kind == KIND_WL) {
+        if (s->dmabuf_inited) {
+            if (s->ctx == ctx) { dmabuf_rebind(s); return 0; }
+            dmabuf_teardown(s, 0);
+        }
+        if (dmabuf_init(s, ver)) { DBG("[shim] wayland: dmabuf init failed (no fallback)\n"); return -1; }
+        s->ctx = ctx;
+        surf_pacing_update(s);
+        return 0;
+    }
 
     if (s->dmabuf_inited) {
         if (s->ctx == ctx) { dmabuf_rebind(s); return 0; }
@@ -1758,6 +1812,7 @@ EXPORT int eglGetError(void) {
 }
 
 EXPORT void* eglGetDisplay(void* native) {
+            if (getenv("SHIM_WAYLAND") || wl_wsi_is_wl_display(native)) return shim_wl_display(native);
     if (getenv("SHIM_GBM")) return gbm_display(native);
     return shim_display(native, -1, 0);
 }
@@ -1795,6 +1850,7 @@ static void* device_display(void* native, int has_attribs) {
 }
 
 static void* platform_display(unsigned platform, void* native, int scr) {
+    if (platform == EGL_PLATFORM_WAYLAND_KHR) return shim_wl_display(native);
     if (platform == EGL_PLATFORM_GBM_KHR) return gbm_display(native);
     if (platform == EGL_PLATFORM_SURFACELESS_MESA) return surfaceless_display(native);
     if (platform == EGL_PLATFORM_ANGLE_ANGLE)
@@ -1827,9 +1883,9 @@ EXPORT void* eglGetPlatformDisplayEXT(unsigned platform, void* native, const int
 
 EXPORT void* eglGetPlatformDisplay(unsigned platform, void* native, const intptr_t* at) {
     int other;
-  DBG("[shim] getPlatformDisplay platform=0x%x native=%p\n", platform, native);
-for (const intptr_t* a = at; a && *a != E_NONE; a += 2)
-    DBG("[shim]   attr 0x%lx = 0x%lx\n", (long)a[0], (long)a[1]);
+    DBG("[shim] getPlatformDisplay platform=0x%x native=%p\n", platform, native);
+    for (const intptr_t* a = at; a && *a != E_NONE; a += 2)
+        DBG("[shim]   attr 0x%lx = 0x%lx\n", (long)a[0], (long)a[1]);
     if (!track_refs_check(at, &other)) { SET_ERR(E_BAD_ATTRIBUTE); return NULL; }
     if (platform == EGL_PLATFORM_DEVICE_EXT)
         return device_display(native, other);
@@ -1852,9 +1908,37 @@ static int want_es1(void) {
     }
     return v;
 }
-  
+
+static __thread int T_internal;
+EXPORT void shim_egl_internal(int on) { T_internal = on; }
+
+static int api_mode_env(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("EGL_API");
+        v = 0;
+        if (e) {
+            if (!strcasecmp(e, "GL") || !strcasecmp(e, "OPENGL")) v = 1;
+            else if (!strcasecmp(e, "GL_ES") || !strcasecmp(e, "GLES") ||
+                     !strcasecmp(e, "OPENGL_ES")) v = 2;
+        }
+    }
+    return v;
+}
+static int api_mode(void) { return T_internal ? 0 : api_mode_env(); }
+
+/* GL API is active: explicit bind or GL-only mode (where ES is disabled) */
+static inline int gl_api_active(void) { return g_gl_mapped || api_mode() == 1; }
+/* API used for symbol resolution: current context takes priority,
+   falling back to eglBindAPI / GL-only mode. */
+static inline int gl_sym_active(void) { return T_cur_gl || gl_api_active(); }
+
+                
 EXPORT unsigned eglBindAPI(unsigned api) {
     if (shim_init()) return 0;
+    /* Reject APIs disallowed by EGL_API mode */
+    if ((api == 0x30A2 && api_mode() == 2) ||
+        (api == 0x30A0 && api_mode() == 1)) { SET_ERR(E_BAD_PARAMETER); return 0; }
     static unsigned (*f)(unsigned);
     if (!f) *(void**)&f = rsym("eglBindAPI");
     if (!f) return 0;
@@ -1871,7 +1955,7 @@ EXPORT unsigned eglQueryAPI(void) {
     static unsigned (*f)(void);
     if (!f) *(void**)&f = rsym("eglQueryAPI");
     unsigned r = f ? f() : 0;
-    return (g_gl_mapped && r == 0x30A0) ? 0x30A2 : r;
+    return (gl_api_active() && r == 0x30A0) ? 0x30A2 : r;
 }
 
 EXPORT unsigned eglChooseConfig(void* d, const int* at, void** c, int n, int* num) {
@@ -1879,6 +1963,17 @@ EXPORT unsigned eglChooseConfig(void* d, const int* at, void** c, int n, int* nu
     static unsigned (*f)(void*, const int*, void**, int, int*);
     if (!f) *(void**)&f = rsym("eglChooseConfig");
     if (!f) return 0;
+
+    int want_gl = 0, want_es = 0;
+    for (const int* a = at; a && a[0] != E_NONE; a += 2)
+        if ((a[0] == 0x3040 || a[0] == 0x3042) && a[1] != -1) {
+            if (a[1] & 0x8)  want_gl = 1;
+            if (a[1] & 0x45) want_es = 1;   /* ES1 | ES2 | ES3 */
+        }
+    if ((api_mode() == 2 && want_gl) || (api_mode() == 1 && want_es && !want_gl)) {
+        if (num) *num = 0;
+        return 1;                           /* No matching config in restricted API mode */
+    }
 
     int tmp[128], k = 0;
     for (const int* a = at; a && a[0] != E_NONE && k < 120; a += 2) {
@@ -1905,11 +2000,13 @@ PT(unsigned, eglWaitNative, (int e), (e))
 EXPORT unsigned eglReleaseThread(void) {
     g_gl_mapped = 0;
     T_surf = NULL;
+    T_cur_gl = 0;
     if (shim_init()) return 0;
     static unsigned (*f)(void);
     if (!f) *(void**)&f = rsym("eglReleaseThread");
     return f ? f() : 0;
 }
+
   
 PT(unsigned, eglBindTexImage, (void* d, void* s, int b), (d, s, b))
 PT(unsigned, eglReleaseTexImage, (void* d, void* s, int b), (d, s, b))
@@ -1932,6 +2029,14 @@ EXPORT unsigned eglQueryContext(void* d, void* c, int a, int* v) {
     if (shim_init()) return 0;
     static unsigned (*f)(void*, void*, int, int*);
     if (!f) *(void**)&f = rsym("eglQueryContext");
+    if (a == 0x3097 && v) {            /* EGL_CONTEXT_CLIENT_TYPE */
+        int found = 0, gl = 0;
+        pthread_mutex_lock(&G.mu);
+        for (int i = 0; i < G.nctx; i++)
+            if (G.ctx[i] == c) { gl = (G.api[i] == 2); found = 1; break; }
+        pthread_mutex_unlock(&G.mu);
+        if (found) { *v = gl ? 0x30A2 : 0x30A0; return 1; }
+    }
     if (a == 0x3138 && v) {
         unsigned r = f ? f(d, c, a, v) : 0;
         if (r) return r;
@@ -1947,12 +2052,14 @@ EXPORT unsigned eglQueryContext(void* d, void* c, int a, int* v) {
     return f ? f(d, c, a, v) : 0;
 }
 
+
 typedef struct img_rec {
     struct img_rec* next;
     void* img;
     int fourcc, nplanes;
     int fd[3], off[3], pitch[3];
     uint64_t mod;
+  int w, h;
 } img_rec;
 static img_rec* g_imgs;
 
@@ -1962,27 +2069,39 @@ static void img_record(void* img, const int* a) {
     r->img = img;
     r->mod = 0x00ffffffffffffffULL;
     for (int i = 0; i < 3; i++) r->fd[i] = -1;
+
     static const int FD[3]  = { 0x3272, 0x3275, 0x3278 };
     static const int OFF[3] = { 0x3273, 0x3276, 0x3279 };
     static const int PIT[3] = { 0x3274, 0x3277, 0x327A };
     static const int ML[3]  = { 0x3443, 0x3445, 0x3447 };
     static const int MH[3]  = { 0x3444, 0x3446, 0x3448 };
-    unsigned lo = 0, hi = 0; int have_mod = 0;
+
+    unsigned lo = 0, hi = 0;
+    int have_mod = 0;
+
     for (; a && a[0] != E_NONE; a += 2) {
-        if (a[0] == 0x3271) r->fourcc = a[1];
+        if (a[0] == 0x3057) r->w = a[1];        /* EGL_WIDTH */
+        else if (a[0] == 0x3056) r->h = a[1];   /* EGL_HEIGHT */
+        else if (a[0] == 0x3271) r->fourcc = a[1];
+
         for (int p = 0; p < 3; p++) {
             if (a[0] == FD[p])  { r->fd[p] = a[1]; if (p + 1 > r->nplanes) r->nplanes = p + 1; }
             if (a[0] == OFF[p]) r->off[p] = a[1];
             if (a[0] == PIT[p]) r->pitch[p] = a[1];
         }
+
         if (a[0] == ML[0]) { lo = (unsigned)a[1]; have_mod = 1; }
         if (a[0] == MH[0]) { hi = (unsigned)a[1]; have_mod = 1; }
     }
+
     if (have_mod) r->mod = ((uint64_t)hi << 32) | lo;
+
     pthread_mutex_lock(&G.mu);
-    r->next = g_imgs; g_imgs = r;
+    r->next = g_imgs;
+    g_imgs = r;
     pthread_mutex_unlock(&G.mu);
 }
+
 
 static img_rec* img_find_copy(void* img, img_rec* out) {
     img_rec* r;
@@ -2067,6 +2186,16 @@ static void drm_img_release(void* img) {
   
 EXPORT void* eglCreateImageKHR(void* d, void* c, unsigned t, void* b, const int* a) {
     if (shim_init()) return NULL;
+  if (t == 0x31D5) {                              /* EGL_WAYLAND_BUFFER_WL */
+    struct wlsrv_info i;
+    if (!wlsrv_info(b, &i)) { SET_ERR(E_BAD_PARAMETER); return NULL; }
+    for (const int* p = a; p && p[0] != E_NONE; p += 2)
+        if (p[0] == 0x31D6 && p[1] != 0) { SET_ERR(E_BAD_PARAMETER); return NULL; }
+    int da[] = { 0x3057, i.w, 0x3056, i.h, 0x3271, (int)i.fourcc,
+                 0x3272, i.fd, 0x3273, i.off, 0x3274, i.stride,
+                 0x30D2, 1, 0x3038 };
+    return eglCreateImageKHR(d, NULL, 0x3270, NULL, da);
+}
     void* imp_ab = NULL;
     if (t == 0x31D3) {                         /* EGL_DRM_BUFFER_MESA */
         drm_img* r = drm_img_find_name((int)(intptr_t)b);
@@ -2163,8 +2292,6 @@ EXPORT void* eglCreateDRMImageMESA(void* d, const int* at) {
     return img;
 }
 
-
-
 EXPORT unsigned eglExportDRMImageMESA(void* d, void* image, int* name, int* handle, int* stride) {
     (void)d;
     drm_img* r = drm_img_find(image);
@@ -2213,7 +2340,7 @@ EXPORT void* eglCreateSyncKHR(void* d, unsigned t, const int* at) {
     shim_sync* s = calloc(1, sizeof *s);
     if (!s) { SET_ERR(E_BAD_ALLOC); return NULL; }
     s->type = t;
-      if (t == 0x30FA) {                      /* EGL_SYNC_REUSABLE_KHR */
+    if (t == 0x30FA) {                      /* EGL_SYNC_REUSABLE_KHR */
         s->reusable = 1;
         s->signaled = (st == 0x30F2);
         pthread_mutex_lock(&G.mu); s->next = g_syncs; g_syncs = s; pthread_mutex_unlock(&G.mu);
@@ -2254,14 +2381,14 @@ EXPORT int eglClientWaitSyncKHR(void* d, void* sync, int flags, uint64_t t) {
     static int (*f)(void*, void*, int, uint64_t);
     if (!f) *(void**)&f = rsym("eglClientWaitSyncKHR");
     shim_sync* s = sync_find(sync);
-      if (s && s->reusable) {
+    if (s && s->reusable) {
         uint64_t waited = 0;
         while (!__atomic_load_n(&s->signaled, __ATOMIC_ACQUIRE)) {
             if (t == 0 || (t != ~0ULL && waited >= t)) return 0x30F5;   /* TIMEOUT */
             usleep(1000); waited += 1000000ULL;
         }
         return 0x30F6;
-      }
+    }
     if (s && !s->real) return 0x30F6;       /* EGL_CONDITION_SATISFIED_KHR */
     return f ? f(d, s ? s->real : sync, flags, t) : 0;
 }
@@ -2281,12 +2408,12 @@ EXPORT unsigned eglGetSyncAttribKHR(void* d, void* sync, int a, int* v) {
     static unsigned (*f)(void*, void*, int, int*);
     if (!f) *(void**)&f = rsym("eglGetSyncAttribKHR");
     shim_sync* s = sync_find(sync);
-      if (s && s->reusable) {
+    if (s && s->reusable) {
         if (!v) { SET_ERR(E_BAD_PARAMETER); return 0; }
         if (a == 0x30F7) { *v = 0x30FA; return 1; }
         if (a == 0x30F1) { *v = __atomic_load_n(&s->signaled, __ATOMIC_ACQUIRE) ? 0x30F2 : 0x30F3; return 1; }
         SET_ERR(E_BAD_ATTRIBUTE); return 0;
-      }
+    }
     if (s && !s->real) {
         if (!v) { SET_ERR(E_BAD_PARAMETER); return 0; }
         switch (a) {
@@ -2330,7 +2457,7 @@ EXPORT unsigned eglUnsignalSyncEXT(void* d, void* sync, const intptr_t* at) {
     return 1;
 }
 
-  EXPORT unsigned eglSignalSyncKHR(void* d, void* sync, unsigned mode) {
+EXPORT unsigned eglSignalSyncKHR(void* d, void* sync, unsigned mode) {
     (void)d;
     shim_sync* s = sync_find(sync);
     if (!s || !s->reusable) { SET_ERR(E_BAD_PARAMETER); return 0; }
@@ -2361,14 +2488,16 @@ EXPORT int eglDupNativeFenceFDANDROID(void* d, void* sync) {
 
 static const char CLIENT_EXTS[] =
     "EGL_EXT_client_extensions EGL_EXT_platform_base EGL_EXT_platform_x11 "
-    "EGL_KHR_platform_x11 EGL_EXT_platform_xcb EGL_MESA_platform_surfaceless "
+    "EGL_KHR_platform_x11 EGL_EXT_platform_xcb EGL_EXT_platform_wayland EGL_KHR_platform_wayland "
+    "EGL_MESA_platform_surfaceless "
     "EGL_KHR_platform_gbm EGL_MESA_platform_gbm EGL_EXT_device_query EGL_KHR_display_reference "
     "EGL_EXT_device_enumeration EGL_EXT_device_base EGL_EXT_platform_device EGL_ANGLE_platform_angle "
     "EGL_KHR_client_get_all_proc_addresses EGL_EXT_query_reset_notification_strategy EGL_KHR_debug EGL_EXT_explicit_device ";
 
 static const char* const CLIENT_LIST[] = {
     "EGL_EXT_client_extensions", "EGL_EXT_platform_base", "EGL_EXT_platform_x11",
-    "EGL_KHR_platform_x11", "EGL_EXT_platform_xcb", "EGL_MESA_platform_surfaceless",
+    "EGL_KHR_platform_x11", "EGL_EXT_platform_xcb", "EGL_EXT_platform_wayland",
+    "EGL_KHR_platform_wayland", "EGL_MESA_platform_surfaceless",
     "EGL_KHR_platform_gbm", "EGL_MESA_platform_gbm", "EGL_EXT_device_query",
     "EGL_EXT_device_enumeration", "EGL_EXT_device_base", "EGL_EXT_platform_device", "EGL_KHR_display_reference",
     "EGL_KHR_client_get_all_proc_addresses", "EGL_EXT_query_reset_notification_strategy", "EGL_ANGLE_platform_angle", "EGL_KHR_debug", "EGL_EXT_explicit_device",
@@ -2386,7 +2515,9 @@ EXPORT const char* eglQueryString(void* d, int name) {
         if (name == 0x3055) return CLIENT_EXTS;
         SET_ERR(E_BAD_DISPLAY); return NULL;
     }
-    if (name == 0x308D) return "OpenGL OpenGL_ES";   /* EGL_CLIENT_APIS */
+    if (name == 0x308D)   /* EGL_CLIENT_APIS */
+        return api_mode() == 1 ? "OpenGL" :
+               api_mode() == 2 ? "OpenGL_ES" : "OpenGL OpenGL_ES";
     if (shim_init()) return NULL;
     static const char* (*f)(void*, int);
     if (!f) *(void**)&f = rsym("eglQueryString");
@@ -2400,6 +2531,7 @@ EXPORT const char* eglQueryString(void* d, int name) {
         "EGL_KHR_create_context_no_error", "EGL_KHR_context_flush_control",
         "EGL_KHR_image_pixmap", "EGL_ANDROID_get_native_client_buffer",
         "EGL_ANDROID_native_fence_sync", "EGL_EXT_sync_reuse", "EGL_MESA_query_driver", "EGL_MESA_image_dma_buf_export", "EGL_MESA_drm_image", "EGL_EXT_swap_tearing_hint",
+        "EGL_WL_create_wayland_buffer_from_image", "EGL_WL_bind_wayland_display"
     };
     static struct { const char* src; char* out; } cache[16];
     static int ncache;
@@ -2438,8 +2570,11 @@ EXPORT const char* eglQueryString(void* d, int name) {
             !has_token(nb, "EGL_KHR_create_context")) continue;
         if (!strcmp(x, "EGL_KHR_image_pixmap") &&
             (!has_token(nb, "EGL_KHR_image_base") || gbm_load())) continue;
-                if (!strcmp(x, "EGL_ANDROID_get_native_client_buffer") &&
+        if (!strcmp(x, "EGL_ANDROID_get_native_client_buffer") &&
             (!has_token(nb, "EGL_ANDROID_image_native_buffer") || ahb_init() || !ahb_to_anwb)) continue;
+      if (!strcmp(x, "EGL_WL_create_wayland_buffer_from_image") &&
+    (!has_token(nb, "EGL_KHR_image_base") || !G.plat_wl)) continue;
+      if (!strcmp(x, "EGL_WL_bind_wayland_display") && !has_token(nb, "EGL_KHR_image_base")) continue;
         if (!strcmp(x, "EGL_KHR_reusable_sync") && !has_token(nb, "EGL_KHR_fence_sync")) continue;
         n += snprintf(nb + n, cap - n, "%s%s", n ? " " : "", x);
     }
@@ -2457,7 +2592,7 @@ EXPORT unsigned eglGetConfigAttrib(void* d, void* cfg, int attr, int* v) {
     if (r && v) {
         if (attr == 0x302E) {
             if (G.root_visual) *v = (int)G.root_visual;
-            else if (G.gdpy && !G.dpy) {
+            else if ((G.gdpy && !G.dpy) || G.plat_wl) {
                 switch (*v) {
                 case 1: case 5: *v = 0x34325241; break; /* ARGB8888 */
                 case 2:         *v = 0x34325258; break; /* XRGB8888 */
@@ -2465,7 +2600,11 @@ EXPORT unsigned eglGetConfigAttrib(void* d, void* cfg, int attr, int* v) {
                 }
             }
         }
-        if ((attr == 0x3040 || attr == 0x3042) && (*v & 0x4)) *v |= 0x8;
+        if (attr == 0x3040 || attr == 0x3042) {
+            if (api_mode() == 1)            *v = (*v & 0x45) ? 0x8 : 0;
+            else if (api_mode() == 0 && (*v & 0x4)) *v |= 0x8;
+            /* mode 2: report only what the driver supports, without OPENGL_BIT */
+        }
         if (attr == 0x302F) *v = 4;
     }
     return r;
@@ -2473,18 +2612,21 @@ EXPORT unsigned eglGetConfigAttrib(void* d, void* cfg, int attr, int* v) {
 
 EXPORT void* eglCreateWindowSurface(void* d, void* cfg, unsigned long win, const int* at) {
     (void)cfg; (void)at;
+    if (is_wl_display(d)) return make_wl_surface(d, (void*)win);
     if (is_gbm_display(d)) return make_gbm_surface((void*)win);
     return make_window_surface(d, (uint32_t)win);
 }
 EXPORT void* eglCreatePlatformWindowSurfaceEXT(void* d, void* cfg, void* native_window, const int* at) {
     (void)cfg; (void)at;
     if (!native_window) { SET_ERR(E_BAD_NATIVE_WINDOW); return NULL; }
+    if (is_wl_display(d)) return make_wl_surface(d, native_window);
     if (is_gbm_display(d)) return make_gbm_surface(native_window);
     return make_window_surface(d, native_win(native_window));
 }
 EXPORT void* eglCreatePlatformWindowSurface(void* d, void* cfg, void* native_window, const intptr_t* at) {
     (void)cfg; (void)at;
     if (!native_window) { SET_ERR(E_BAD_NATIVE_WINDOW); return NULL; }
+    if (is_wl_display(d)) return make_wl_surface(d, native_window);
     if (is_gbm_display(d)) return make_gbm_surface(native_window);
     return make_window_surface(d, native_win(native_window));
 }
@@ -2513,7 +2655,8 @@ static void surf_free_later(shim_surf* s) {
     pthread_mutex_unlock(&G.mu);
     free(old);
 }
-  static void surf_release(shim_surf* s, int with_gl) {
+
+static void surf_release(shim_surf* s, int with_gl) {
     if (s->is_gbm) gbm_teardown(s, with_gl);
     if (s->dmabuf_inited) dmabuf_teardown(s, with_gl);
     if (s->wsi) {
@@ -2523,7 +2666,7 @@ static void surf_free_later(shim_surf* s) {
     }
     __atomic_store_n(&s->magic, 0, __ATOMIC_RELEASE);
     surf_free_later(s);
-  }
+}
   
 EXPORT unsigned eglDestroySurface(void* d, void* surf) {
     if (shim_init()) return 0;
@@ -2547,7 +2690,7 @@ EXPORT unsigned eglDestroySurface(void* d, void* surf) {
     if (T_surf == s) T_surf = NULL;
     surf_release(s, cur && cur() == s->ctx);
     return 1;
-  }
+}
 
 EXPORT unsigned eglQuerySurface(void* d, void* surf, int attr, int* v) {
     shim_surf* s = find_surf(surf);
@@ -2593,16 +2736,26 @@ EXPORT unsigned eglSurfaceAttrib(void* d, void* surf, int attr, int v) {
     static unsigned (*f)(void*, void*, int, int);
     if (!f) *(void**)&f = rsym("eglSurfaceAttrib");
     return f ? f(d, surf, attr, v) : 0;
-  }
+}
+
+static void* libgl_handle(void) {
+    static void* h;
+    if (h) return h;
+    const char* env = getenv("SHIM_LIBGL");          /* optional: full path */
+    if (env && *env) h = dlopen(env, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) h = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen("libGL.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen("libGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) h = dlopen("libGL.so", RTLD_NOW | RTLD_GLOBAL);
+    return h;
+}
 
 static void* emu_sym(const char* n) {
-    static void* h;
-    if (!h) {
-        h = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
-        if (!h) h = dlopen("libGL.so.1", RTLD_NOW | RTLD_GLOBAL);
-    }
+    void* h = libgl_handle();
     return h ? dlsym(h, n) : NULL;
 }
+
+static void* gl_self_sym(const char* n) { return emu_sym(n); }
   
 static void set_emu_ctx(void* ctx) {
     void (*cur)(void*) = (void (*)(void*))emu_sym("glx_shim_egl_current");
@@ -2635,17 +2788,17 @@ EXPORT void* eglCreateContext(void* d, void* cfg, void* share, const int* at) {
             continue;
         }
         if (a[0] == 0x31B3) {              /* NO_ERROR_KHR: TRUE(1) / FALSE(0) only */
-            if (a[1] != 0 && a[1] != 1) { 
-                SET_ERR(E_BAD_ATTRIBUTE); 
-                return NULL; 
+            if (a[1] != 0 && a[1] != 1) {
+                SET_ERR(E_BAD_ATTRIBUTE);
+                return NULL;
             }
             DBG("[shim] ctx attr 0x31B3 = %d (NO_ERROR_KHR validated & ignored)\n", a[1]);
             continue;
         }
         if (a[0] == 0x2097) {              /* RELEASE_BEHAVIOR: NONE(0) / FLUSH(0x2098) */
-            if (a[1] != 0 && a[1] != 0x2098) { 
-                SET_ERR(E_BAD_ATTRIBUTE); 
-                return NULL; 
+            if (a[1] != 0 && a[1] != 0x2098) {
+                SET_ERR(E_BAD_ATTRIBUTE);
+                return NULL;
             }
             DBG("[shim] ctx attr 0x2097 = 0x%x (RELEASE_BEHAVIOR validated & ignored)\n", a[1]);
             continue;
@@ -2655,14 +2808,16 @@ EXPORT void* eglCreateContext(void* d, void* cfg, void* share, const int* at) {
     fil[fk] = E_NONE;
     at = fil;
 
+    int gl_m = gl_api_active();
+
     /* Log cleaned input attributes */
-    DBG("[shim] ctx request: g_gl_mapped=%d share=%p\n", g_gl_mapped, share);
+    DBG("[shim] ctx request: gl_m=%d (g_gl_mapped=%d) share=%p\n", gl_m, g_gl_mapped, share);
     for (const int* a = at; a && a[0] != E_NONE; a += 2)
         DBG("[shim]   ctx attr 0x%x = 0x%x\n", a[0], a[1]);
 
     int san[64];
     int major = 0, minor = 0, profile = 0, flags = 0, have = 0;
-    if (g_gl_mapped) {
+    if (gl_m) {
         int k = 0;
         for (const int* a = at; a && a[0] != E_NONE && k < 56; a += 2) {
             if (a[0] == 0x3098) { major = a[1]; have = 1; continue; } /* EGL_CONTEXT_CLIENT_VERSION */
@@ -2679,8 +2834,8 @@ EXPORT void* eglCreateContext(void* d, void* cfg, void* share, const int* at) {
         san[k] = E_NONE;
         at = san;
     }
-    int es1 = g_gl_mapped && want_es1();
-    int ver = g_gl_mapped ? 2 : 1, has_ver = 0;
+    int es1 = gl_m && want_es1();
+    int ver = gl_m ? 2 : 1, has_ver = 0;
     int rst = 0x31BE;
     for (const int* a = at; a && a[0] != E_NONE; a += 2) {
         if (a[0] == 0x3098) { ver = a[1]; has_ver = 1; }
@@ -2736,7 +2891,7 @@ EXPORT void* eglCreateContext(void* d, void* cfg, void* share, const int* at) {
             DBG("[shim] eglCreateContext direct -> %p\n", c);
         }
 
-        if (!c && ver == 3 && g_gl_mapped) {
+        if (!c && ver == 3 && gl_m) {
             int tmp[64], k = 0;
             for (const int* a = at; a && a[0] != E_NONE && k < 58; a += 2) {
                 tmp[k++] = a[0];
@@ -2760,16 +2915,17 @@ EXPORT void* eglCreateContext(void* d, void* cfg, void* share, const int* at) {
 
     if (c) {
         void* gctx = NULL;
-        if (g_gl_mapped) {
+        if (gl_m) {
             void* (*mk)(int, int, int, int, int) =
                 (void* (*)(int, int, int, int, int))emu_sym("glx_shim_egl_ctx");
             if (mk) gctx = mk(ver, major, minor, profile, flags);
         }
-        pthread_mutex_lock(&G.mu);
+                pthread_mutex_lock(&G.mu);
         if (G.nctx < 64) {
             G.ctx[G.nctx] = c;
             G.ver[G.nctx] = ver;
             G.rst[G.nctx] = rst;
+            G.api[G.nctx] = gl_m ? 2 : 1;
             G.gctx[G.nctx] = gctx;
             G.nctx++;
         } else if (gctx) {
@@ -2777,6 +2933,7 @@ EXPORT void* eglCreateContext(void* d, void* cfg, void* share, const int* at) {
             if (fr) fr(gctx);
         }
         pthread_mutex_unlock(&G.mu);
+
     }
     return c;
 }
@@ -2798,12 +2955,13 @@ EXPORT unsigned eglDestroyContext(void* d, void* ctx) {
         s->rel_next = hit; 
         hit = s;
     }
-    for (int i = 0; i < G.nctx; i++)
+        for (int i = 0; i < G.nctx; i++)
         if (G.ctx[i] == ctx) {
             dead = G.gctx[i];
             G.ctx[i]  = G.ctx[--G.nctx];
             G.ver[i]  = G.ver[G.nctx];
             G.rst[i]  = G.rst[G.nctx];
+            G.api[i]  = G.api[G.nctx];
             G.gctx[i] = G.gctx[G.nctx];
             break;
         }
@@ -2835,18 +2993,24 @@ EXPORT unsigned eglMakeCurrent(void* d, void* draw, void* read, void* ctx) {
     if (!s) s = find_surf(read);
     if (!s || !ctx) {
         unsigned r = mc(d, draw, read, ctx);
-        if (r) { T_surf = NULL; set_emu_ctx(ctx); }
+        if (r) {
+            T_surf = NULL;
+            T_cur_gl = ctx ? ctx_is_gl(ctx) : 0;
+            set_emu_ctx(ctx);
+        }
         return r;
     }
     if (!mc(d, NULL, NULL, ctx)) return 0;
     if (surf_attach(s, ctx)) {
         mc(d, NULL, NULL, NULL);
         T_surf = NULL;
+        T_cur_gl = 0;
         set_emu_ctx(NULL);
         SET_ERR(E_BAD_ALLOC);
         return 0;
     }
     T_surf = s;
+    T_cur_gl = ctx_is_gl(ctx);
     set_emu_ctx(ctx);
     return 1;
 }
@@ -2931,6 +3095,8 @@ EXPORT unsigned shim_x11_default_fbo(void) {
     return cs ? surf_default_fbo(cs) : 0;
 }
 
+  EXPORT int shim_x11_cur_gl(void) { return T_cur_gl; }
+  
 static int is_valid_device(void* dev) { return dev == (void*)&g_device_obj; }
 
 EXPORT unsigned eglQueryDisplayAttribKHR(void* d, int attr, intptr_t* value) {
@@ -3172,7 +3338,6 @@ EXPORT unsigned eglQueryDeviceBinaryEXT(void* dev, int name, int max_size, void*
     return 1;
 }
 
-
 /* ---------- DRM nodes via libdrm (dlopen) ---------- */
 typedef struct { char** nodes; int available_nodes; } drm_dev_prefix;
 #define DRM_NODE_PRIMARY_I 0
@@ -3240,6 +3405,28 @@ EXPORT const char* eglQueryDeviceStringEXT(void* dev, int name) {
     }
 }
 
+EXPORT unsigned eglBindWaylandDisplayWL(void* d, void* wd) {
+    (void)d;
+    if (shim_init()) return 0;
+    pthread_once(&g_drm_once, drm_probe);
+    return wlsrv_bind(wd, g_drm_render);
+}
+EXPORT unsigned eglUnbindWaylandDisplayWL(void* d, void* wd) {
+    (void)d; return wlsrv_unbind(wd);
+}
+EXPORT unsigned eglQueryWaylandBufferWL(void* d, void* res, int attr, int* v) {
+    (void)d;
+    struct wlsrv_info i;
+    if (!v || !wlsrv_info(res, &i)) return 0;      /* not a buffer EGL -> FALSE */
+    switch (attr) {
+    case 0x3080: *v = (i.fourcc == 0x34325241) ? 0x305F : 0x305E; return 1; /* RGBA / RGB */
+    case 0x3057: *v = i.w; return 1;
+    case 0x3056: *v = i.h; return 1;
+    case 0x31DB: *v = 1;   return 1;   /* Y_INVERTED */
+    default: SET_ERR(E_BAD_ATTRIBUTE); return 0;
+    }
+}
+  
 EXPORT const char* eglGetDisplayDriverName(void* d) {
     if (!d) { SET_ERR(E_BAD_DISPLAY); return NULL; }
     if (shim_init()) { SET_ERR(E_BAD_DISPLAY); return NULL; }
@@ -3283,7 +3470,7 @@ EXPORT unsigned eglInitialize(void* d, int* maj, int* min) {
             if (k < 0 && !g_dref[i].refs) k = i;
         }
         if (k >= 0) { g_dref[k].d = d; g_dref[k].refs++; }
-              else DBG("[shim] eglInitialize: MAX_DPY (%d) reached, display %p not tracked\n", MAX_DPY, d);
+        else DBG("[shim] eglInitialize: MAX_DPY (%d) reached, display %p not tracked\n", MAX_DPY, d);
         pthread_mutex_unlock(&G.mu);
     }
     return r;
@@ -3366,12 +3553,6 @@ EXPORT unsigned eglTerminate(void* d) {
     return f(d);
 }
 
-static void* gl_self_sym(const char* n) {
-    static void* h;
-    if (!h) h = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
-    return h ? dlsym(h, n) : NULL;
-}
-
 EXPORT unsigned eglExportDMABUFImageQueryMESA(void* d, void* image, int* fourcc,
                                               int* nplanes, uint64_t* mods) {
     (void)d;
@@ -3404,6 +3585,24 @@ EXPORT unsigned eglExportDMABUFImageMESA(void* d, void* image, int* fds,
     return 1;
 }
 
+EXPORT void* eglCreateWaylandBufferFromImageWL(void* d, void* image) {
+    if (shim_init()) { SET_ERR(E_BAD_DISPLAY); return NULL; }
+    if (!is_wl_display(d)) { SET_ERR(E_BAD_DISPLAY); return NULL; }
+    if (!image) { SET_ERR(E_BAD_PARAMETER); return NULL; }
+
+    img_rec r;
+    if (!img_find_copy(image, &r) || r.nplanes != 1 ||
+        r.fd[0] < 0 || r.w <= 0 || r.h <= 0) {
+        SET_ERR(E_BAD_MATCH);   
+        return NULL;
+    }
+    void* buf = swl_buffer_from_dmabuf(d, (uint32_t)r.fourcc, r.w, r.h,
+                                       r.fd[0], (uint32_t)r.pitch[0],
+                                       (uint32_t)r.off[0], r.mod);
+    if (!buf) SET_ERR(E_BAD_MATCH);
+    return buf;
+}
+
 EXPORT unsigned eglPostSubBufferNV(void* d, void* surf, int x, int y, int w, int h) {
     shim_surf* s = find_surf(surf);
     if (!s) {                       /* pbuffer / Mali surface */
@@ -3422,6 +3621,16 @@ EXPORT unsigned eglPostSubBufferNV(void* d, void* surf, int x, int y, int w, int
 EXPORT void* eglGetNativeClientBufferANDROID(const void* ahb) {
     if (!ahb || ahb_init() || !ahb_to_anwb) { SET_ERR(E_BAD_PARAMETER); return NULL; }
     return ahb_to_anwb((void*)ahb);
+}
+
+static void* gles_shim_sym(const char* n) {
+    static void* h;
+    if (!h) {
+        h = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen("libGLESv2.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+    }
+    return h ? dlsym(h, n) : NULL;
 }
   
 /* ---------- eglGetProcAddress ---------- */
@@ -3449,24 +3658,50 @@ EXPORT void* eglGetProcAddress(const char* name) {
         PA(eglQueryDisplayAttribEXT), PA(eglQueryDisplayAttribKHR),
         PA(eglQueryDeviceAttribEXT), PA(eglQueryDeviceStringEXT),
         PA(eglQueryDmaBufFormatsEXT), PA(eglQueryDmaBufModifiersEXT),
-        PA(eglPostSubBufferNV), PA(eglSignalSyncKHR),
+        PA(eglPostSubBufferNV), PA(eglSignalSyncKHR), PA(eglCreateWaylandBufferFromImageWL),
+      PA(eglBindWaylandDisplayWL), PA(eglUnbindWaylandDisplayWL), PA(eglQueryWaylandBufferWL),
         { "glBindFramebuffer", (void*)shim_glBindFramebuffer },
         { "glBindFramebufferOES", (void*)shim_glBindFramebuffer },
     };
     if (!name) return NULL;
+
+    /* 1. Shader / string hooks: from libGL when GL symbols are active, otherwise from GLES shim */
+    if (!strcmp(name, "glShaderSource") || !strcmp(name, "glGetString") ||
+        !strcmp(name, "glGetStringi")   || !strcmp(name, "glGetIntegerv")) {
+        void* p = NULL;
+        if (gl_sym_active()) {
+            p = emu_sym(name);                 /* loads libGL if needed when GL symbols are active */
+        } else {
+            void* h = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+            if (!h) h = dlopen("libGL.so", RTLD_NOW | RTLD_NOLOAD);
+            if (h) p = dlsym(h, name);
+        }
+        if (!p) p = gles_shim_sym(name);       /* ES-only app: essl hook */
+        if (p) return p;
+    }
+
+    /* 2. glDrawBuffersEXT -> glDrawBuffers */
+    if (!strcmp(name, "glDrawBuffersEXT") || !strcmp(name, "glDrawBuffersNV")) {
+        if (shim_init() == 0 && G.gpa) {
+            void* p = G.gpa("glDrawBuffers");
+            if (p) return p;
+        }
+    }
+
+    /* 3. Remaining static table and GL emulation symbols */
     for (unsigned i = 0; i < sizeof tab / sizeof tab[0]; i++)
         if (!strcmp(name, tab[i].n)) return tab[i].f;
-    if (g_gl_mapped && name[0]=='g' && name[1]=='l' && name[2]!='X') {
+    if (gl_sym_active() && name[0]=='g' && name[1]=='l' && name[2]!='X') {
         void* p = gl_self_sym(name);
         if (p) return p;
     }
     if (shim_init() || !G.gpa) return NULL;
     void* r = G.gpa(name);
-if (!r) DBG("[shim] getproc MISS %s\n", name);
-return r;
+    if (!r) DBG("[shim] getproc MISS %s\n", name);
+    return r;
 }
 
-  __attribute__((destructor))
+__attribute__((destructor))
 static void shim_atexit(void) {
     if (!G.ready || !shim_debug_enabled()) return;
     int n = 0;
