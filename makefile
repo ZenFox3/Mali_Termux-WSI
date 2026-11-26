@@ -13,6 +13,8 @@ CXXFLAGS ?= -O2 -Wall -fPIC
 CXXFLAGS += --target=$(TARGET)
 BUILD    := build
 LDFLAGS  += --target=$(TARGET) -L$(BUILD)
+MALI_CL_LIB ?= /vendor/lib64/egl/libGLES_mali.so
+NM          ?= nm
 
 # ---- Vulkan ----
 VK_DIR  := API/Vulkan
@@ -79,12 +81,15 @@ DRI_OUT    := $(BUILD)/ahb_drv_video.so
 DRI_CFLAGS := -D_GNU_SOURCE -I$(DRI_DIR)/Include -I$(PREFIX)/include
 
 # ---- GLES ----
-GLES_DIR    := API/GLES
-GLES_SRC    := $(GLES_DIR)/Scripts/libGLESv2_shim.c
-GLES_DEPS   := $(wildcard $(GLES_DIR)/Include/*) $(wildcard API/EGL/Include/*)
-GLES_OUT    := $(BUILD)/libGLESv2.so.2
-GLES_CFLAGS := -I$(GLES_DIR)/Include -IAPI/EGL/Include
-GLES_LIBS   := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
+GLES_DIR      := API/GLES
+GLES_SRC      := $(GLES_DIR)/Scripts/libGLESv2_shim.c
+GLES_CM_SRC   := $(GLES_SRC) # sau un fișier separat dacă ai unul dedicat
+GLES_DEPS     := $(wildcard $(GLES_DIR)/Include/*) $(wildcard API/EGL/Include/*)
+GLES_OUT      := $(BUILD)/libGLESv2.so.2
+GLES_CM_OUT   := $(BUILD)/libGLESv1_CM.so.1
+GLES_CFLAGS   := -I$(GLES_DIR)/Include -IAPI/EGL/Include
+GLES_CM_CFLAGS:= $(GLES_CFLAGS) -DGLES_CM_SHIM
+GLES_LIBS     := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread
 
 # ---- EGL ----
 EGL_DIR    := API/EGL
@@ -141,9 +146,20 @@ GL_CXXFLAGS   := -std=c++17 -fvisibility=hidden -I$(GL_DIR)/Include \
 # SPV_LIBS comes before -lc++: the SPIRV-Cross archives need libc++ symbols
 GL_LIBS       := -lxcb -lxcb-dri3 -lxcb-present -lEGL $(SPV_LIBS) -ldl -lpthread -lm -lc++
 
-.PHONY: all vulkan glu glut glfw gbm drm dri gles egl gl protocols clean
+# ---- OpenCL ----
+CL_DIR      := API/CL
+CL_SRC      := $(CL_DIR)/Scripts/libOpenCL_shim.c
+CL_OUT      := $(BUILD)/libOpenCL.so.1
+CL_MAP      := $(BUILD)/cl/cl.map
+CL_LIST_H   := $(BUILD)/cl/cl_list.h
+CL_GEN_SH   := $(BUILD)/cl/gen_cl_exports.sh
+CL_CFLAGS   := -I$(CL_DIR)/Include -I$(BUILD)/cl -IAPI/EGL/Include
+CL_LIBS     := -ldl
 
-all: vulkan gbm drm dri gles egl gl glu glut glfw protocols
+
+.PHONY: all vulkan glu glut glfw gbm drm dri gles gles1 egl gl cl protocols clean
+
+all: vulkan gbm drm dri gles gles1 egl gl glu glut glfw cl protocols
 
 vulkan: $(VK_OUT)
 glu:    $(GLU_OUT)
@@ -153,8 +169,10 @@ gbm:    $(GBM_OUT)
 drm:    $(DRM_OUT)
 dri:    $(DRI_OUT)
 gles:   $(GLES_OUT)
+gles1: $(GLES_CM_OUT)
 egl:    $(EGL_OUT)
 gl:     $(GL_OUT)
+cl:     $(CL_OUT)
 protocols: $(EGL_GEN_H) $(EGL_GEN_C)
 
 $(VK_OUT): $(VK_SRC) $(VK_DEPS) $(VK_WL_SRC) $(VK_WL_HDR)
@@ -200,11 +218,15 @@ $(DRI_OUT): $(DRI_SRC) $(DRI_DEPS)
 
 $(GLES_OUT): $(GLES_SRC) $(GLES_DEPS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(GLES_CFLAGS) -shared -Wl,-soname,libGLESv2.so.2 $< -o $@ $(LDFLAGS) $(GLES_LIBS)
+	$(CC) $(CFLAGS) $(GLES_CFLAGS) -shared -Wl,-soname,libGLESv2.so $< -o $@ $(LDFLAGS) $(GLES_LIBS)
 	cp $(GLES_OUT) $(BUILD)/libGLESv2.so
 	cp $(GLES_OUT) $(BUILD)/libGLESv3.so
-	cp $(GLES_OUT) $(BUILD)/libGLESv1_CM.so.1
-	cp $(GLES_OUT) $(BUILD)/libGLESv1_CM.so
+	cp $(GLES_OUT) $(BUILD)/libGLESv3.so.3
+  
+$(GLES_CM_OUT): $(GLES_CM_SRC) $(GLES_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(GLES_CM_CFLAGS) -shared -Wl,-soname,libGLESv1_CM.so $< -o $@ $(LDFLAGS) $(GLES_LIBS)
+	cp $(GLES_CM_OUT) $(BUILD)/libGLESv1_CM.so
 
 # ---- wayland-scanner: client protocols ----
 define WL_CLIENT_RULE
@@ -256,6 +278,42 @@ $(GL_OUT): $(GL_SHIM_OBJ) $(GL_BRIDGE_OBJ) | $(EGL_OUT)
 	cp $(GL_OUT) $(BUILD)/libGL.so
 	cp $(GL_OUT) $(BUILD)/libGLX.so
 	cp $(GL_OUT) $(BUILD)/libGLX.so.0
+
+$(CL_LIST_H) $(CL_MAP): $(CL_SRC)
+	@mkdir -p $(@D)
+	@printf '%s\n' \
+		'#!/bin/sh' \
+		'set -e' \
+		'LIB="$$1"; LIST_H="$$2"; MAP_F="$$3"' \
+		'"$(NM)" -D --defined-only "$$LIB" | grep -E " T cl[A-Z]" | sed -E "s/.* T (cl[A-Za-z0-9_]+).*/X(\1)/" | sort -u > "$$LIST_H"' \
+		'echo "OpenCL symbols found: $$(wc -l < "$$LIST_H")"' \
+		'emit() {' \
+		'  ver="$$1"; prev="$$2"; shift 2' \
+		'  echo "$$ver {"' \
+		'  echo "  global:"' \
+		'  for s in "$$@"; do grep -qxF "X($$s)" "$$LIST_H" && echo "    $$s;"; done' \
+		'  if [ -n "$$prev" ]; then echo "} $$prev;"; else echo "};"; fi' \
+		'}' \
+		'{' \
+		'  emit OPENCL_1.0 "" clGetPlatformIDs clGetPlatformInfo clGetDeviceIDs clGetDeviceInfo clCreateContext clCreateContextFromType clRetainContext clReleaseContext clGetContextInfo clCreateCommandQueue clRetainCommandQueue clReleaseCommandQueue clGetCommandQueueInfo clCreateBuffer clRetainMemObject clReleaseMemObject clGetSupportedImageFormats clGetMemObjectInfo clGetImageInfo clCreateSampler clRetainSampler clReleaseSampler clGetSamplerInfo clCreateProgramWithSource clCreateProgramWithBinary clRetainProgram clReleaseProgram clBuildProgram clUnloadCompiler clGetProgramInfo clGetProgramBuildInfo clCreateKernel clCreateKernelsInProgram clRetainKernel clReleaseKernel clSetKernelArg clGetKernelInfo clGetKernelWorkGroupInfo clWaitForEvents clGetEventInfo clRetainEvent clReleaseEvent clGetEventProfilingInfo clFlush clFinish clEnqueueReadBuffer clEnqueueWriteBuffer clEnqueueCopyBuffer clEnqueueReadImage clEnqueueWriteImage clEnqueueCopyImage clEnqueueMapBuffer clEnqueueMapImage clEnqueueUnmapMemObject clEnqueueNDRangeKernel clEnqueueTask clEnqueueNativeKernel clEnqueueMarker clEnqueueWaitForEvents clEnqueueBarrier clGetExtensionFunctionAddress' \
+		'  emit OPENCL_1.1 OPENCL_1.0 clCreateSubBuffer clSetMemObjectDestructorCallback clEnqueueReadBufferRect clEnqueueWriteBufferRect clEnqueueCopyBufferRect clCreateUserEvent clSetUserEventStatus clSetEventCallback clGetGLObjectInfo clGetGLTextureInfo clEnqueueAcquireGLObjects clEnqueueReleaseGLObjects clCreateEventFromGLsyncKHR' \
+		'  emit OPENCL_1.2 OPENCL_1.1 clCreateSubDevices clRetainDevice clReleaseDevice clCreateImage clCreateProgramWithBuiltInKernels clCompileProgram clLinkProgram clUnloadPlatformCompiler clGetKernelArgInfo clEnqueueFillBuffer clEnqueueFillImage clEnqueueMigrateMemObjects clEnqueueMarkerWithWaitList clEnqueueBarrierWithWaitList clGetExtensionFunctionAddressForPlatform' \
+		'  emit OPENCL_2.0 OPENCL_1.2 clCreateCommandQueueWithProperties clCreatePipe clGetPipeInfo clSVMAlloc clSVMFree clEnqueueSVMFree clEnqueueSVMMemcpy clEnqueueSVMMemFill clEnqueueSVMMap clEnqueueSVMUnmap clCreateSamplerWithProperties clSetKernelArgSVMPointer clSetKernelExecInfo clEnqueueSVMigrateMem' \
+		'  emit OPENCL_2.1 OPENCL_2.0 clSetDefaultDeviceCommandQueue clGetDeviceAndHostTimer clGetHostTimer clCreateProgramWithIL clCloneKernel clGetKernelSubGroupInfo clEnqueueSVMMigrateMem' \
+		'  emit OPENCL_2.2 OPENCL_2.1 clSetProgramReleaseCallback clSetProgramSpecializationConstant' \
+		'  emit OPENCL_3.0 OPENCL_2.2 clCreateBufferWithProperties clCreateImageWithProperties clSetContextDestructorCallback' \
+		'} > "$$MAP_F"' \
+		> "$(CL_GEN_SH)"
+	@chmod +x "$(CL_GEN_SH)"
+	@"$(CL_GEN_SH)" "$(MALI_CL_LIB)" "$(CL_LIST_H)" "$(CL_MAP)"
+
+$(CL_OUT): $(CL_SRC) $(CL_LIST_H) $(CL_MAP)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CL_CFLAGS) -fvisibility=hidden -shared \
+		-Wl,-soname,libOpenCL.so -Wl,--version-script=$(CL_MAP) \
+		$< -o $@ $(LDFLAGS) $(CL_LIBS)
+	cp $(CL_OUT) $(BUILD)/libOpenCL.so
+
 
 clean:
 	rm -rf $(BUILD)

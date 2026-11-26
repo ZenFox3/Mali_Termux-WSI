@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/select.h>
-#include <GL/glut.h>
+#include "glut.h"
 
 static Display *dpy; static Window win; static GLXContext ctx; static int scr;
 static XVisualInfo *vinfo;
@@ -31,6 +31,10 @@ static void (*f_spec)(int,int,int), (*f_specup)(int,int,int);
 static void (*f_mouse)(int,int,int,int);
 static void (*f_motion)(int,int), (*f_pmotion)(int,int);
 static void (*f_vis)(int), (*f_entry)(int);
+static void (*f_close)(void);
+static void (*f_wheel)(int,int,int,int);
+static int action_on_close = GLUT_ACTION_EXIT;
+static void *window_data;
 
 #define MAX_TIMERS 256
 static struct { long target_time; void (*func)(int); int value; int used; } Timers[MAX_TIMERS];
@@ -159,6 +163,44 @@ void glutDestroyWindow(int window_id) {
 
 int  glutGetWindow(void) { return win ? 1 : 0; }
 void glutSetWindow(int window_id) { (void)window_id; }
+
+void glutCloseFunc(void (*func)(void))   { f_close = func; }
+void glutWMCloseFunc(void (*func)(void)) { f_close = func; }
+void glutMouseWheelFunc(void (*func)(int,int,int,int)) { f_wheel = func; }
+void *glutGetWindowData(void)       { return window_data; }
+void  glutSetWindowData(void *data) { window_data = data; }
+
+void glutSetOption(GLenum option, int value) {
+  if (option == GLUT_ACTION_ON_WINDOW_CLOSE) action_on_close = value;
+}
+
+/* Approximate teapot (NOT the Utah teapot): built from sphere, cone and torus.
+   Y is up, spout points to +X, "size" scales it like the original. */
+static void teapot(double size, int wire) {
+  void (*sph)(GLdouble,GLint,GLint) = wire ? glutWireSphere : glutSolidSphere;
+  void (*cne)(GLdouble,GLdouble,GLint,GLint) = wire ? glutWireCone : glutSolidCone;
+  void (*tor)(GLdouble,GLdouble,GLint,GLint) = wire ? glutWireTorus : glutSolidTorus;
+  GLboolean had_norm = glIsEnabled(GL_NORMALIZE);
+  glEnable(GL_NORMALIZE);
+  glPushMatrix();
+  glScaled(size, size, size);
+  glRotated(-90, 1, 0, 0);                 /* sphere/cone z axis -> up */
+
+  glPushMatrix(); glScaled(1, 1, 0.75); sph(0.5, 24, 16); glPopMatrix();      /* body */
+  glPushMatrix(); glTranslated(0, 0, 0.36); glScaled(1, 1, 0.5);
+                  sph(0.2, 16, 8); glPopMatrix();                              /* lid */
+  glPushMatrix(); glTranslated(0, 0, 0.5); sph(0.05, 10, 6); glPopMatrix();    /* knob */
+  glPushMatrix(); glTranslated(0.4, 0, 0.0); glRotated(60, 0, 1, 0);
+                  cne(0.09, 0.5, 12, 4); glPopMatrix();                        /* spout */
+  glPushMatrix(); glTranslated(-0.5, 0, 0.0); glRotated(90, 1, 0, 0);
+                  tor(0.04, 0.2, 8, 16); glPopMatrix();                        /* handle */
+
+  glPopMatrix();
+  if (!had_norm) glDisable(GL_NORMALIZE);
+}
+void glutSolidTeapot(GLdouble size) { teapot(size, 0); }
+void glutWireTeapot(GLdouble size)  { teapot(size, 1); }
+
 int  glutCreateSubWindow(int parent, int x, int y, int width, int height) {
   (void)parent; (void)x; (void)y; (void)width; (void)height;
   return 0;
@@ -246,6 +288,8 @@ void glutSetCursor(int cursor_type) {
 int glutGet(GLenum query) {
   switch (query) {
     case GLUT_ELAPSED_TIME: return (int)(get_now_ms() - start_time_ms);
+    case GLUT_VERSION: return 30800;
+    case GLUT_ACTION_ON_WINDOW_CLOSE: return action_on_close;
     case GLUT_WINDOW_X: return WX;
     case GLUT_WINDOW_Y: return WY;
     case GLUT_WINDOW_WIDTH: return W;
@@ -302,8 +346,6 @@ int glutExtensionSupported(const char *name) {
   }
   return 0;
 }
-
-typedef void (*GLUTproc)(void);
 
 GLUTproc glutGetProcAddress(const char *name) {
   return (GLUTproc)dlsym(RTLD_DEFAULT, name);
@@ -443,17 +485,23 @@ static void handle_xevent(XEvent *event) {
 
     case ButtonPress:
     case ButtonRelease: {
-      int button = event->xbutton.button - 1;
+      unsigned b = event->xbutton.button;
+      int down = (event->type == ButtonPress);
       update_modifiers(event->xbutton.state);
       mouse_x = event->xbutton.x; mouse_y = event->xbutton.y;
-      if (!f_mouse) break;
 
-      if (button < 3) {
-        f_mouse(button, event->type == ButtonPress ? GLUT_DOWN : GLUT_UP, mouse_x, mouse_y);
-      } else if (event->type == ButtonPress) {
-        /* Mouse wheel buttons (3 & 4), matching FreeGLUT semantics */
-        f_mouse(button, GLUT_DOWN, mouse_x, mouse_y);
-        f_mouse(button, GLUT_UP, mouse_x, mouse_y);
+      if (b <= 3) {
+        if (f_mouse) f_mouse((int)b - 1, down ? GLUT_DOWN : GLUT_UP, mouse_x, mouse_y);
+      } else if (down) {
+        if (b <= 7 && f_wheel) {
+          static const int wheel[4] = {0, 0, 1, 1};     /* X buttons 4,5 = vertical; 6,7 = horizontal */
+          static const int dir[4]   = {1, -1, -1, 1};
+          f_wheel(wheel[b - 4], dir[b - 4], mouse_x, mouse_y);
+        } else if (f_mouse) {
+          /* no wheel callback: old behaviour, wheel as buttons 3.. */
+          f_mouse((int)b - 1, GLUT_DOWN, mouse_x, mouse_y);
+          f_mouse((int)b - 1, GLUT_UP, mouse_x, mouse_y);
+        }
       }
       break;
     }
@@ -469,7 +517,11 @@ static void handle_xevent(XEvent *event) {
       break;
 
     case ClientMessage:
-      if ((Atom)event->xclient.data.l[0] == wm_delete_window) exit(0);
+      if ((Atom)event->xclient.data.l[0] == wm_delete_window) {
+        if (f_close) f_close();
+        if (action_on_close == GLUT_ACTION_EXIT) exit(0);
+        glutDestroyWindow(1);   /* single window: main loop ends */
+      }
       break;
   }
 }
