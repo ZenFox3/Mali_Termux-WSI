@@ -1,7 +1,6 @@
 /*
  * libOpenCL_shim.c - libOpenCL.so.1 for Mali: AArch64 trampolines to cl* in libGLES_mali.so (SPHAL).
  * Regular OpenCL apps (clinfo, pyopencl, ffmpeg...) see the driver without an ICD loader.
- * Build: sh build_cl.sh     Run: LD_LIBRARY_PATH=$PWD clinfo
  */
 #define _GNU_SOURCE
 #include "mali_sphal.h"
