@@ -19,7 +19,10 @@ VK_DIR  := API/Vulkan
 VK_SRC  := $(VK_DIR)/Scripts/libvulkan.c
 VK_DEPS := $(wildcard $(VK_DIR)/Include/*)
 VK_OUT  := $(BUILD)/libvulkan.so.1
-VK_LIBS := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread -lxcb-shm
+VK_WL_SRC := $(BUILD)/wayland/linux-dmabuf-protocol.c
+VK_WL_HDR := $(BUILD)/wayland/linux-dmabuf-client.h
+VK_CFLAGS := -I$(BUILD)/wayland
+VK_LIBS := -lxcb -lxcb-dri3 -lxcb-present -ldl -lpthread -lxcb-shm -lwayland-client
 
 # make XLIB=1  -> Xlib support
 ifeq ($(XLIB),1)
@@ -154,9 +157,10 @@ egl:    $(EGL_OUT)
 gl:     $(GL_OUT)
 protocols: $(EGL_GEN_H) $(EGL_GEN_C)
 
-$(VK_OUT): $(VK_SRC) $(VK_DEPS)
+$(VK_OUT): $(VK_SRC) $(VK_DEPS) $(VK_WL_SRC) $(VK_WL_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(VK_FLAGS) -shared -Wl,-soname,libvulkan.so.1 $< -o $@ $(LDFLAGS) $(VK_LIBS)
+	$(CC) $(CFLAGS) $(VK_CFLAGS) $(VK_FLAGS) -shared -Wl,-soname,libvulkan.so.1 \
+		$(VK_SRC) $(VK_WL_SRC) -o $@ $(LDFLAGS) $(VK_LIBS)
 	cp $(VK_OUT) $(BUILD)/libvulkan.so
 
 $(BUILD)/glu/%.o: %.c

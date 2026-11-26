@@ -2,16 +2,21 @@
 #define VULKAN_WSI_X11_H
 
 /* Env vars (Debug & Override):
-     VULKAN_DEBUG=1      enables verbose informational logging
-     VULKAN_CPU=1        forces CPU copy mode
-     VULKAN_SYNC=1       synchronous zero-copy (no presentation thread)
-     VULKAN_NOVSYNC=1    ignores requested present mode: always presents ASYNC (like IMMEDIATE)
-     VULKAN_DMABUF=1     zero-copy using "system" dma-buf heap (libdmabufheap.so), without AHB
-     VULKAN_DMABUF=name  same, using another heap (e.g. system-uncached)
-     VULKAN_NOSHM=1      disables MIT-SHM for CPU copy                                         */
+     VULKAN_DEBUG=1             enables verbose informational logging
+     VULKAN_CPU=1               forces CPU copy mode
+     VULKAN_SYNC=1              synchronous zero-copy (no presentation thread)
+     VULKAN_NOVSYNC=1           ignores requested present mode: always presents ASYNC (like IMMEDIATE)
+     VULKAN_DMABUF=1            zero-copy using "system" dma-buf heap (libdmabufheap.so), without AHB
+     VULKAN_DMABUF=name         same, using another heap (e.g. system-uncached)
+     VULKAN_NOSHM=1             disables MIT-SHM for CPU copy
+     VULKAN_HEADLESS_DUMP=dir   dumps rendered frames as PPM files in headless mode               */
 
 #ifndef VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
+#endif
+
+#ifndef VK_USE_PLATFORM_WAYLAND_KHR
+#define VK_USE_PLATFORM_WAYLAND_KHR
 #endif
 
 #ifndef VK_USE_PLATFORM_ANDROID_KHR
@@ -33,6 +38,9 @@
 #include <xcb/dri3.h>
 #include <xcb/present.h>
 #include <xcb/shm.h>
+#include <wayland-client.h>
+#include "linux-dmabuf-client.h"
+#define WSI_DRM_XRGB8888 0x34325258u
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <android/hardware_buffer.h>
@@ -67,14 +75,14 @@ static const char* const wsi_dev_exts[] = {
     "VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf" };
 #define WSI_N_DEV_EXTS (sizeof wsi_dev_exts / sizeof *wsi_dev_exts)
 
-/* ---------- Helper for conditional debugging (Cached) ---------- */
+/* Cached debug flag check */
 static inline int wsi_dbg_enabled(void) {
     static int v = -1;
     if (v < 0) v = (getenv("VULKAN_DEBUG") != NULL || getenv("VULKAN_LAYER_DEBUG") != NULL) ? 1 : 0;
     return v;
 }
 
-/* ---------- Global State (Single Context) ---------- */
+/* Global layer state */
 static mali_ctx*                        g_c;
 static PFN_vkGetInstanceProcAddr        g_real_gipa;
 static PFN_vkGetDeviceProcAddr          g_real_gdpa;
@@ -129,26 +137,46 @@ static struct {
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID GetAndroidHardwareBufferPropertiesANDROID;
 } w;
 
-/* dma-buf heap & ION fallback (libdmabufheap.so), activated with VULKAN_DMABUF */
+/* Optional dma-buf heap and ION allocator table (libdmabufheap.so) */
 static struct {
     void*       (*create)(void);
     int         (*alloc)(void*, const char*, size_t, unsigned, size_t);
     int         (*alloc_sys)(void*, int, size_t, unsigned, size_t);
     bool        (*check_ion)(void*);
     int         (*map_ion)(void*, const char*, const char*, unsigned, unsigned, unsigned);
-    void*       a;      /* BufferAllocator* */
+    void*       a;
     const char* heap;
     int         on;
 } g_dh;
 
-/* ---------- Objects ---------- */
+/* Surface and swapchain objects */
 #define WSI_SURF_MAGIC 0x57534958u
+
+typedef enum { WSI_XCB = 0, WSI_HEADLESS = 1, WSI_WAYLAND = 2 } wsi_kind;
+
 typedef struct {
     uint32_t          magic;
+    wsi_kind          kind;
+    /* XCB state */
     xcb_connection_t* conn;
     xcb_window_t      win;
     xcb_gcontext_t    gc;
+    /* Wayland state */
+    struct wl_display*          wl_dpy;
+    struct wl_surface*          wl_surf; /* Application surface */
+    struct wl_surface*          wl_sw;   /* Surface proxy bound to private queue */
+    struct wl_event_queue*      wl_q;
+    struct wl_registry*         wl_reg;
+    struct wl_shm*              shm;
+    struct zwp_linux_dmabuf_v1* dmabuf;
+    uint32_t  dmabuf_ver;
+    int       dmabuf_ok, have_linear;
+    uint32_t  mod_hi, mod_lo;
+    struct wl_callback*         frame_cb;
+    int       frame_pending;
 } wsi_surface;
+
+static void wsi_wl_surface_free(wsi_surface* s);
 
 static wsi_surface* wsi_surf(VkSurfaceKHR h) {
     wsi_surface* s = (wsi_surface*)(uintptr_t)h;
@@ -159,6 +187,8 @@ static wsi_surface* wsi_surf(VkSurfaceKHR h) {
     return s;
 }
 
+typedef struct { void* s; uint32_t idx; } wsi_wl_bd;
+
 typedef struct {
     VkDevice        dev;
     wsi_surface*    surf;
@@ -168,40 +198,49 @@ typedef struct {
     int             zc, coherent;
     VkImage         img[WSI_MAX_IMG];
     VkDeviceMemory  imem[WSI_MAX_IMG];
-    /* Zero-copy mode */
+    /* Zero-copy resources */
     AHardwareBuffer* ahb[WSI_MAX_IMG];
     xcb_pixmap_t    pm[WSI_MAX_IMG];
-    /* CPU copy mode */
+    /* CPU readback / copy resources */
     VkBuffer        buf[WSI_MAX_IMG];
     VkDeviceMemory  bmem[WSI_MAX_IMG];
     uint8_t*        map[WSI_MAX_IMG];
     VkCommandBuffer cmd[WSI_MAX_IMG];
     VkCommandPool   pool;
     VkFence         fence;
-    /* MIT-SHM (CPU copy) */
+    /* MIT-SHM shared buffer */
     xcb_shm_seg_t   shm_seg;
     uint8_t*        shm_ptr;
     size_t          shm_size;
-    /* Asynchronous presentation */
+    /* Asynchronous presentation queue */
     int             async, quit;
     pthread_t       th;
     pthread_mutex_t mu;
     pthread_cond_t  cv;
-    int             state[WSI_MAX_IMG]; /* 0: free, 1: acquire, 2: queue, 3: present pending */
+    int             state[WSI_MAX_IMG]; /* 0: free, 1: acquired, 2: queued, 3: present pending */
     uint32_t        q[WSI_MAX_IMG], qh, qn;
     VkSemaphore     isemaphore[WSI_MAX_IMG];
     int             sfd[WSI_MAX_IMG];
-    /* Mode, Resize & Eventfd Handling */
+    /* Present mode, resize tracking, and worker wakeup fd */
     VkPresentModeKHR mode;
-    int             wfd;            /* eventfd: wakes up worker from poll */
-    VkExtent2D      base;           /* window extent upon creation */
-    int             stale;          /* window size has changed */
+    int             wfd;
+    VkExtent2D      base;
+    int             stale;
     int             gck_pending;
     xcb_get_geometry_cookie_t gck;
     uint64_t        gck_t;
+    uint32_t        dump_n; /* Frame counter for VULKAN_HEADLESS_DUMP */
+    /* Wayland buffer state */
+    struct wl_buffer* wl_buf[WSI_MAX_IMG];
+    wsi_wl_bd       wl_bd[WSI_MAX_IMG];
+    int             wl_state[WSI_MAX_IMG]; /* 0: free, 1: acquired, 2: owned by compositor */
+    uint8_t*        wl_map;
+    size_t          wl_map_size, wl_bsize;
 } wsi_swapchain;
 
 #define WSI_H2P(h) ((void*)(uintptr_t)(h))
+#define WSI_HAS_BUF(s, i) ((s)->pm[i] || (s)->wl_buf[i])
+static void wsi_wl_release(wsi_swapchain* s);
 
 static uint32_t wsi_find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < g_mp.memoryTypeCount; i++)
@@ -210,18 +249,16 @@ static uint32_t wsi_find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     return UINT32_MAX;
 }
 
-/* Forward declarations */
 static PFN_vkVoidFunction VKAPI_CALL wsi_core_gipa(VkInstance i, const char* n);
 static PFN_vkVoidFunction VKAPI_CALL wsi_core_gdpa(VkDevice d, const char* n);
 
-/* Lazy loader for device ProcAddr */
 static PFN_vkGetDeviceProcAddr wsi_real_gdpa_get(void) {
     if (!g_real_gdpa && g_c && g_c->inst && g_real_gipa)
         g_real_gdpa = (PFN_vkGetDeviceProcAddr)g_real_gipa(g_c->inst, "vkGetDeviceProcAddr");
     return g_real_gdpa;
 }
 
-/* ---------- Feature Clamping System ---------- */
+/* Feature clamping against hardware capabilities */
 static const char* const wsi_feat_names[] = {
     "robustBufferAccess","fullDrawIndexUint32","imageCubeArray","independentBlend",
     "geometryShader","tessellationShader","sampleRateShading","dualSrcBlend","logicOp",
@@ -265,7 +302,7 @@ static int wsi_clamp_features(VkPhysicalDeviceFeatures* req, const VkPhysicalDev
     return removed;
 }
 
-/* =====================  WSI LAYER CHAIN  ===================== */
+/* Chained Vulkan layers */
 #define WSI_MAX_LY 16
 #define WSI_DEFAULT_LAYER_DIR "/data/data/com.termux/files/home/Mali_Desktop/Vulkan/Debug"
 
@@ -399,19 +436,30 @@ static void wsi_ly_load(const VkInstanceCreateInfo* ci) {
     }
 }
 
-/* =====================  SURFACE  ===================== */
-
+/* Surface creation and queries */
 static VkResult VKAPI_CALL wsi_CreateXcbSurfaceKHR(VkInstance i,
         const VkXcbSurfaceCreateInfoKHR* ci, const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
     (void)i; (void)a;
     wsi_surface* s = calloc(1, sizeof *s);
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
     s->magic = WSI_SURF_MAGIC;
-    s->conn = ci->connection;
-    s->win  = ci->window;
-    s->gc   = xcb_generate_id(s->conn);
+    s->kind  = WSI_XCB;
+    s->conn  = ci->connection;
+    s->win   = ci->window;
+    s->gc    = xcb_generate_id(s->conn);
     xcb_create_gc(s->conn, s->gc, s->win, 0, NULL);
     xcb_flush(s->conn);
+    *out = (VkSurfaceKHR)(uintptr_t)s;
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL wsi_CreateHeadlessSurfaceEXT(VkInstance i,
+        const VkHeadlessSurfaceCreateInfoEXT* ci, const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
+    (void)i; (void)ci; (void)a;
+    wsi_surface* s = calloc(1, sizeof *s);
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->magic = WSI_SURF_MAGIC;
+    s->kind  = WSI_HEADLESS;
     *out = (VkSurfaceKHR)(uintptr_t)s;
     return VK_SUCCESS;
 }
@@ -421,8 +469,12 @@ static void VKAPI_CALL wsi_DestroySurfaceKHR(VkInstance i, VkSurfaceKHR surf,
     (void)i; (void)a;
     wsi_surface* s = wsi_surf(surf);
     if (!s) return;
-    xcb_free_gc(s->conn, s->gc);
-    xcb_flush(s->conn);
+    if (s->kind == WSI_XCB) {
+        xcb_free_gc(s->conn, s->gc);
+        xcb_flush(s->conn);
+    } else if (s->kind == WSI_WAYLAND) {
+        wsi_wl_surface_free(s);
+    }
     s->magic = 0;
     free(s);
 }
@@ -450,11 +502,18 @@ static VkResult VKAPI_CALL wsi_GetPDSurfaceCapabilitiesKHR(VkPhysicalDevice pd,
     (void)pd;
     wsi_surface* s = wsi_surf(surf);
     if (!s) return VK_ERROR_SURFACE_LOST_KHR;
-    xcb_get_geometry_reply_t* g =
-        xcb_get_geometry_reply(s->conn, xcb_get_geometry(s->conn, s->win), NULL);
-    if (!g) return VK_ERROR_SURFACE_LOST_KHR;
-    VkExtent2D e = { g->width, g->height };
-    free(g);
+
+    VkExtent2D e;
+    if (s->kind != WSI_XCB) {
+        e = (VkExtent2D){ 0xFFFFFFFFu, 0xFFFFFFFFu }; /* Extent is chosen by the swapchain */
+    } else {
+        xcb_get_geometry_reply_t* g =
+            xcb_get_geometry_reply(s->conn, xcb_get_geometry(s->conn, s->win), NULL);
+        if (!g) return VK_ERROR_SURFACE_LOST_KHR;
+        e = (VkExtent2D){ g->width, g->height };
+        free(g);
+    }
+
     memset(caps, 0, sizeof *caps);
     caps->minImageCount = 3;
     caps->maxImageCount = WSI_MAX_IMG;
@@ -501,8 +560,13 @@ static VkResult VKAPI_CALL wsi_GetPDSurfacePresentModesKHR(VkPhysicalDevice pd,
     return r;
 }
 
-/* =====================  SWAPCHAIN  ===================== */
+/* Forward declarations for swapchain and Wayland helpers */
+static VkResult wsi_wl_shm_setup(wsi_swapchain* s);
+static int wsi_import_fd(wsi_swapchain* s, uint32_t i, int fd, size_t len, uint32_t stride);
+static VkResult wsi_wl_acquire(wsi_swapchain* s, uint64_t timeout, uint32_t* out);
+static void wsi_wl_present(wsi_swapchain* s, uint32_t idx);
 
+/* Swapchain management and presentation */
 static void wsi_setup(wsi_swapchain* s, VkDevice dev, const VkSwapchainCreateInfoKHR* ci) {
     memset(s, 0, sizeof *s);
     s->dev  = dev;
@@ -515,7 +579,7 @@ static void wsi_setup(wsi_swapchain* s, VkDevice dev, const VkSwapchainCreateInf
     s->mode = getenv("VULKAN_NOVSYNC") ? VK_PRESENT_MODE_IMMEDIATE_KHR : ci->presentMode;
     s->wfd  = -1;
     s->base = s->ext;
-    if (s->surf) {
+    if (s->surf && s->surf->kind == WSI_XCB) {
         xcb_connection_t* cn = s->surf->conn;
         xcb_get_geometry_reply_t* g =
             xcb_get_geometry_reply(cn, xcb_get_geometry(cn, s->surf->win), NULL);
@@ -526,7 +590,7 @@ static void wsi_setup(wsi_swapchain* s, VkDevice dev, const VkSwapchainCreateInf
 static int wsi_memfd(size_t len) {
     int fd = -1;
 #ifdef SYS_memfd_create
-    fd = (int)syscall(SYS_memfd_create, "wsi-shm", 1u /* MFD_CLOEXEC */);
+    fd = (int)syscall(SYS_memfd_create, "wsi-shm", 1u);
 #endif
     if (fd < 0) return -1;
     if (ftruncate(fd, (off_t)len) < 0) { close(fd); return -1; }
@@ -607,6 +671,7 @@ static void wsi_release(wsi_swapchain* s) {
         if (s->ahb[i])  g_ahb.release(s->ahb[i]);
     }
     if (freed_pm) xcb_flush(s->surf->conn);
+    wsi_wl_release(s);
 }
 
 static void wsi_wake(wsi_swapchain* s) {
@@ -873,6 +938,270 @@ static void* wsi_worker(void* arg) {
     return NULL;
 }
 
+/* Wayland surface, dmabuf, and wl_shm helpers */
+static void wsi_wl_dmabuf_format(void* d, struct zwp_linux_dmabuf_v1* z, uint32_t fmt) {
+    (void)z;
+    wsi_surface* sf = d;
+    if (sf->dmabuf_ver < 3 && fmt == WSI_DRM_XRGB8888 && !sf->dmabuf_ok) {
+        sf->dmabuf_ok = 1; sf->mod_hi = 0x00ffffffu; sf->mod_lo = 0xffffffffu;
+    }
+}
+
+static void wsi_wl_dmabuf_modifier(void* d, struct zwp_linux_dmabuf_v1* z,
+        uint32_t fmt, uint32_t hi, uint32_t lo) {
+    (void)z;
+    wsi_surface* sf = d;
+    if (fmt != WSI_DRM_XRGB8888) return;
+    if (hi == 0 && lo == 0) { /* Prefer linear modifier */
+        sf->dmabuf_ok = 1; sf->have_linear = 1; sf->mod_hi = 0; sf->mod_lo = 0;
+    } else if (hi == 0x00ffffffu && lo == 0xffffffffu && !sf->have_linear) {
+        sf->dmabuf_ok = 1; sf->mod_hi = hi; sf->mod_lo = lo; /* Fallback to implicit modifier */
+    }
+}
+
+static const struct zwp_linux_dmabuf_v1_listener wsi_wl_dmabuf_lst = {
+    wsi_wl_dmabuf_format, wsi_wl_dmabuf_modifier };
+
+static void wsi_wl_reg_global(void* d, struct wl_registry* r, uint32_t name,
+        const char* iface, uint32_t ver) {
+    wsi_surface* sf = d;
+    if (!strcmp(iface, "wl_shm")) {
+        sf->shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
+    } else if (!strcmp(iface, "zwp_linux_dmabuf_v1") && ver >= 2) {
+        sf->dmabuf_ver = ver < 3 ? ver : 3;
+        sf->dmabuf = wl_registry_bind(r, name, &zwp_linux_dmabuf_v1_interface, sf->dmabuf_ver);
+        zwp_linux_dmabuf_v1_add_listener(sf->dmabuf, &wsi_wl_dmabuf_lst, sf);
+    }
+}
+
+static void wsi_wl_reg_remove(void* d, struct wl_registry* r, uint32_t name) {
+    (void)d; (void)r; (void)name;
+}
+
+static const struct wl_registry_listener wsi_wl_reg_lst = {
+    wsi_wl_reg_global, wsi_wl_reg_remove };
+
+static void wsi_wl_surface_free(wsi_surface* s) {
+    if (s->frame_cb) { wl_callback_destroy(s->frame_cb); s->frame_cb = NULL; }
+    if (s->dmabuf)   zwp_linux_dmabuf_v1_destroy(s->dmabuf);
+    if (s->shm)      wl_shm_destroy(s->shm);
+    if (s->wl_sw)    wl_proxy_wrapper_destroy(s->wl_sw);
+    if (s->wl_reg)   wl_registry_destroy(s->wl_reg);
+    if (s->wl_q)     wl_event_queue_destroy(s->wl_q);
+    s->dmabuf = NULL; s->shm = NULL; s->wl_sw = NULL; s->wl_reg = NULL; s->wl_q = NULL;
+}
+
+static VkResult VKAPI_CALL wsi_CreateWaylandSurfaceKHR(VkInstance i,
+        const VkWaylandSurfaceCreateInfoKHR* ci, const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
+    (void)i; (void)a;
+    wsi_surface* s = calloc(1, sizeof *s);
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->magic = WSI_SURF_MAGIC;
+    s->kind = WSI_WAYLAND;
+    s->wl_dpy = ci->display;
+    s->wl_surf = ci->surface;
+
+    s->wl_q = wl_display_create_queue(s->wl_dpy);
+    if (!s->wl_q) { free(s); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+    struct wl_display* dw = wl_proxy_create_wrapper(s->wl_dpy);
+    wl_proxy_set_queue((struct wl_proxy*)dw, s->wl_q);
+    s->wl_reg = wl_display_get_registry(dw);
+    wl_proxy_wrapper_destroy(dw);
+    wl_registry_add_listener(s->wl_reg, &wsi_wl_reg_lst, s);
+    wl_display_roundtrip_queue(s->wl_dpy, s->wl_q); /* Bind registry globals */
+    wl_display_roundtrip_queue(s->wl_dpy, s->wl_q); /* Receive dmabuf formats and modifiers */
+
+    if (!s->shm && !s->dmabuf_ok) {
+        fprintf(stderr, "vulkan_error:: Wayland: no wl_shm and no usable linux-dmabuf\n");
+        wsi_wl_surface_free(s);
+        free(s);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    s->wl_sw = wl_proxy_create_wrapper(s->wl_surf);
+    wl_proxy_set_queue((struct wl_proxy*)s->wl_sw, s->wl_q);
+
+    if (wsi_dbg_enabled())
+        fprintf(stderr, "vulkan_debug: wayland surface: shm=%d dmabuf_ver=%u ok=%d mod=%x:%x\n",
+                s->shm != NULL, s->dmabuf_ver, s->dmabuf_ok, s->mod_hi, s->mod_lo);
+    *out = (VkSurfaceKHR)(uintptr_t)s;
+    return VK_SUCCESS;
+}
+
+static VkBool32 VKAPI_CALL wsi_GetWaylandPresentationSupportKHR(VkPhysicalDevice pd,
+        uint32_t qf, struct wl_display* d) {
+    (void)pd; (void)qf; (void)d;
+    return VK_TRUE;
+}
+
+/* Dispatch only the private Wayland queue: 1 = progress, 0 = timeout, -1 = error */
+static int wsi_wl_pump(wsi_surface* sf, int ms) {
+    struct wl_display* d = sf->wl_dpy;
+    if (wl_display_prepare_read_queue(d, sf->wl_q) != 0)
+        return wl_display_dispatch_queue_pending(d, sf->wl_q) >= 0 ? 1 : -1;
+    wl_display_flush(d);
+    struct pollfd p = { wl_display_get_fd(d), POLLIN, 0 };
+    int pr;
+    do { pr = poll(&p, 1, ms); } while (pr < 0 && errno == EINTR);
+    if (pr > 0) { if (wl_display_read_events(d) < 0) return -1; }
+    else wl_display_cancel_read(d);
+    if (wl_display_dispatch_queue_pending(d, sf->wl_q) < 0) return -1;
+    return pr > 0 ? 1 : (pr == 0 ? 0 : -1);
+}
+
+static void wsi_wl_buf_release(void* d, struct wl_buffer* b) {
+    (void)b;
+    wsi_wl_bd* bd = d;
+    wsi_swapchain* s = bd->s;
+    __atomic_store_n(&s->wl_state[bd->idx], 0, __ATOMIC_RELEASE);
+}
+
+static const struct wl_buffer_listener wsi_wl_buf_lst = { wsi_wl_buf_release };
+
+static void wsi_wl_frame_done(void* d, struct wl_callback* cb, uint32_t t) {
+    (void)t;
+    wsi_surface* sf = d;
+    if (cb == sf->frame_cb) {
+        sf->frame_cb = NULL;
+        __atomic_store_n(&sf->frame_pending, 0, __ATOMIC_RELEASE);
+    }
+    wl_callback_destroy(cb);
+}
+
+static const struct wl_callback_listener wsi_wl_frame_lst = { wsi_wl_frame_done };
+
+static void wsi_wl_track(wsi_swapchain* s, uint32_t i, struct wl_buffer* b) {
+    s->wl_bd[i].s = s;
+    s->wl_bd[i].idx = i;
+    s->wl_buf[i] = b;
+    wl_buffer_add_listener(b, &wsi_wl_buf_lst, &s->wl_bd[i]);
+}
+
+/* Allocate wl_shm buffer pool for CPU copy mode */
+static VkResult wsi_wl_shm_setup(wsi_swapchain* s) {
+    wsi_surface* sf = s->surf;
+    if (!sf->shm) return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t stride = s->ext.width * 4;
+    s->wl_bsize = (size_t)stride * s->ext.height;
+    size_t total = s->wl_bsize * s->n;
+    int fd = wsi_memfd(total);
+    if (fd < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    void* p = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { close(fd); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+    s->wl_map = p;
+    s->wl_map_size = total;
+    struct wl_shm_pool* pool = wl_shm_create_pool(sf->shm, fd, (int32_t)total);
+    close(fd);
+    for (uint32_t i = 0; i < s->n; i++) {
+        struct wl_buffer* b = wl_shm_pool_create_buffer(pool, (int32_t)(i * s->wl_bsize),
+            s->ext.width, s->ext.height, stride, WL_SHM_FORMAT_XRGB8888);
+        wsi_wl_track(s, i, b);
+    }
+    wl_shm_pool_destroy(pool);
+    wl_display_flush(sf->wl_dpy);
+    if (wsi_dbg_enabled()) fprintf(stderr, "vulkan_debug: CPU copy via wl_shm\n");
+    return VK_SUCCESS;
+}
+
+/* Import a dma-buf fd as a Wayland buffer; takes ownership and closes fd */
+static int wsi_wl_import(wsi_swapchain* s, uint32_t i, int fd, uint32_t stride) {
+    wsi_surface* sf = s->surf;
+    if (!sf->dmabuf || !sf->dmabuf_ok) { close(fd); return -1; }
+    struct zwp_linux_buffer_params_v1* pr = zwp_linux_dmabuf_v1_create_params(sf->dmabuf);
+    zwp_linux_buffer_params_v1_add(pr, fd, 0, 0, stride, sf->mod_hi, sf->mod_lo);
+    struct wl_buffer* b = zwp_linux_buffer_params_v1_create_immed(pr,
+        s->ext.width, s->ext.height, WSI_DRM_XRGB8888, 0);
+    zwp_linux_buffer_params_v1_destroy(pr);
+    close(fd);
+    if (!b) return -1;
+    wsi_wl_track(s, i, b);
+    return 0;
+}
+
+/* Import fd into XCB DRI3 pixmap or Wayland dmabuf; takes ownership of fd */
+static int wsi_import_fd(wsi_swapchain* s, uint32_t i, int fd, size_t len, uint32_t stride) {
+    wsi_surface* sf = s->surf;
+    if (sf->kind == WSI_WAYLAND) return wsi_wl_import(s, i, fd, stride);
+    xcb_connection_t* cn = sf->conn;
+    xcb_pixmap_t pm = xcb_generate_id(cn);
+    xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffer_checked(cn, pm, sf->win,
+        (uint32_t)len, s->ext.width, s->ext.height, (uint16_t)stride, 24, 32, fd);
+    xcb_generic_error_t* err = xcb_request_check(cn, ck);
+    if (err) { free(err); return -1; }
+    s->pm[i] = pm;
+    return 0;
+}
+
+static void wsi_wl_release(wsi_swapchain* s) {
+    if (!s->surf || s->surf->kind != WSI_WAYLAND) return;
+    for (uint32_t i = 0; i < s->n; i++)
+        if (s->wl_buf[i]) { wl_buffer_destroy(s->wl_buf[i]); s->wl_buf[i] = NULL; }
+    if (s->wl_map) { munmap(s->wl_map, s->wl_map_size); s->wl_map = NULL; }
+    wl_display_flush(s->surf->wl_dpy);
+}
+
+static VkResult wsi_wl_acquire(wsi_swapchain* s, uint64_t timeout, uint32_t* out) {
+    wsi_surface* sf = s->surf;
+    uint64_t t0 = wsi_now_ns();
+    for (;;) {
+        wl_display_dispatch_queue_pending(sf->wl_dpy, sf->wl_q);
+        for (uint32_t j = 0; j < s->n; j++) {
+            uint32_t k = (s->next + j) % s->n;
+            if (__atomic_load_n(&s->wl_state[k], __ATOMIC_ACQUIRE) == 0) {
+                __atomic_store_n(&s->wl_state[k], 1, __ATOMIC_RELEASE);
+                s->next = (k + 1) % s->n;
+                *out = k;
+                return VK_SUCCESS;
+            }
+        }
+        if (timeout == 0) return VK_NOT_READY;
+        int ms = 1000;
+        if (timeout != UINT64_MAX) {
+            uint64_t el = wsi_now_ns() - t0;
+            if (el >= timeout) return VK_TIMEOUT;
+            uint64_t rem = (timeout - el) / 1000000ull + 1;
+            if (rem < 1000) ms = (int)rem;
+        }
+        if (wsi_wl_pump(sf, ms) < 0) return VK_ERROR_SURFACE_LOST_KHR;
+    }
+}
+
+static void wsi_wl_present(wsi_swapchain* s, uint32_t idx) {
+    wsi_surface* sf = s->surf;
+
+    if (!s->zc) { /* Copy host-visible staging buffer into wl_shm pool */
+        if (!s->coherent) {
+            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                .memory = s->bmem[idx], .offset = 0, .size = VK_WHOLE_SIZE };
+            w.InvalidateMappedMemoryRanges(s->dev, 1, &mr);
+        }
+        memcpy(s->wl_map + (size_t)idx * s->wl_bsize, s->map[idx], s->wl_bsize);
+    }
+
+    int vsync = s->mode == VK_PRESENT_MODE_FIFO_KHR;
+    wl_display_dispatch_queue_pending(sf->wl_dpy, sf->wl_q);
+    if (vsync) {
+        uint64_t t0 = wsi_now_ns();
+        while (__atomic_load_n(&sf->frame_pending, __ATOMIC_ACQUIRE) &&
+               wsi_now_ns() - t0 < 100000000ull) /* Bounded wait when surface is hidden */
+            if (wsi_wl_pump(sf, 20) < 0) break;
+    }
+
+    struct wl_surface* sw = sf->wl_sw;
+    __atomic_store_n(&s->wl_state[idx], 2, __ATOMIC_RELEASE);
+    if (vsync) {
+        sf->frame_cb = wl_surface_frame(sw);
+        __atomic_store_n(&sf->frame_pending, 1, __ATOMIC_RELEASE);
+        wl_callback_add_listener(sf->frame_cb, &wsi_wl_frame_lst, sf);
+    }
+    wl_surface_attach(sw, s->wl_buf[idx], 0, 0);
+    if (wl_proxy_get_version((struct wl_proxy*)sf->wl_surf) >= 4)
+        wl_surface_damage_buffer(sw, 0, 0, INT32_MAX, INT32_MAX);
+    else
+        wl_surface_damage(sw, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(sw);
+    wl_display_flush(sf->wl_dpy);
+}
+
 static void wsi_dh_init(void) {
     const char* e = getenv("VULKAN_DMABUF");
     if (!e || !*e || !strcmp(e, "0") || g_dh.on) return;
@@ -940,7 +1269,6 @@ static int wsi_dh_alloc(size_t len) {
 
 static VkResult wsi_zc_image_dh(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* ci, uint32_t i) {
     VkDevice dev = s->dev;
-    xcb_connection_t* cn = s->surf->conn;
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
 
     uint32_t pitch = (s->ext.width * 4 + 63u) & ~63u;
@@ -952,10 +1280,10 @@ static VkResult wsi_zc_image_dh(wsi_swapchain* s, const VkSwapchainCreateInfoKHR
     VkExternalMemoryImageCreateInfo emi = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
-    
-    VkFormat vf[] = { 
-        VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB, 
-        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB 
+
+    VkFormat vf[] = {
+        VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB,
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB
     };
     VkImageFormatListCreateInfo fl = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
@@ -1029,26 +1357,24 @@ static VkResult wsi_zc_image_dh(wsi_swapchain* s, const VkSwapchainCreateInfoKHR
     }
     if ((r = w.BindImageMemory(dev, s->img[i], s->imem[i], 0))) { close(fd); return r; }
 
-    xcb_pixmap_t pm = xcb_generate_id(cn);
-    xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffer_checked(cn, pm, s->surf->win,
-        (uint32_t)len, s->ext.width, s->ext.height, (uint16_t)rowPitch, 24, 32, fd);
-    xcb_generic_error_t* err = xcb_request_check(cn, ck);
-    if (err) {
-        fprintf(stderr, "vulkan_error:: DRI3 PixmapFromBuffer rejected (X error %d)\n", err->error_code);
-        free(err);
+    if (wsi_import_fd(s, i, fd, len, (uint32_t)rowPitch)) {
+        fprintf(stderr, "vulkan_error:: dma-buf import into display server rejected\n");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    s->pm[i] = pm;
     return VK_SUCCESS;
 }
 
 static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* ci) {
     if (!g_zc_ok) return VK_ERROR_FEATURE_NOT_PRESENT;
-    xcb_connection_t* cn = s->surf->conn;
-    xcb_dri3_query_version_reply_t* dv =
-        xcb_dri3_query_version_reply(cn, xcb_dri3_query_version(cn, 1, 0), NULL);
-    if (!dv) return VK_ERROR_FEATURE_NOT_PRESENT;
-    free(dv);
+    if (s->surf->kind == WSI_WAYLAND) {
+        if (!s->surf->dmabuf_ok) return VK_ERROR_FEATURE_NOT_PRESENT;
+    } else {
+        xcb_connection_t* cn = s->surf->conn;
+        xcb_dri3_query_version_reply_t* dv =
+            xcb_dri3_query_version_reply(cn, xcb_dri3_query_version(cn, 1, 0), NULL);
+        if (!dv) return VK_ERROR_FEATURE_NOT_PRESENT;
+        free(dv);
+    }
 
     VkDevice dev = s->dev;
     VkResult r;
@@ -1061,7 +1387,7 @@ static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* c
     if (lm && !strcmp(lm, "vendor3"))
         ahb_usage |= AHARDWAREBUFFER_USAGE_VENDOR_3;
     else if (lm && !strcmp(lm, "none"))
-        ;   /* GPU only */
+        ;
     else
         ahb_usage |= AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
 
@@ -1071,8 +1397,8 @@ static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* c
             continue;
         }
 
-        uint32_t ahb_fmt = (s->fmt == VK_FORMAT_B8G8R8A8_UNORM || s->fmt == VK_FORMAT_B8G8R8A8_SRGB) 
-                           ? AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 
+        uint32_t ahb_fmt = (s->fmt == VK_FORMAT_B8G8R8A8_UNORM || s->fmt == VK_FORMAT_B8G8R8A8_SRGB)
+                           ? AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
                            : AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
 
         AHardwareBuffer_Desc d = {
@@ -1082,13 +1408,13 @@ static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* c
             .format = ahb_fmt,
             .usage  = ahb_usage
         };
-      
+
         if (g_ahb.alloc(&d, &s->ahb[i]) || !s->ahb[i]) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         AHardwareBuffer_Desc got; g_ahb.describe(s->ahb[i], &got);
         const wsi_nh_t* nh = g_ahb.nh(s->ahb[i]);
         if (!nh) return VK_ERROR_INITIALIZATION_FAILED;
 
-        for (int k = 0; k < nh->numFds && !s->pm[i]; k++) {
+        for (int k = 0; k < nh->numFds && !WSI_HAS_BUF(s, i); k++) {
             off_t real = lseek(nh->data[k], 0, SEEK_END);
             lseek(nh->data[k], 0, SEEK_SET);
             if (wsi_dbg_enabled())
@@ -1098,14 +1424,9 @@ static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* c
             if (real <= 0) continue;
             int fd = dup(nh->data[k]);
             if (fd < 0) continue;
-            xcb_pixmap_t cand = xcb_generate_id(cn);
-            xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffer_checked(cn, cand, s->surf->win,
-                (uint32_t)real, s->ext.width, s->ext.height, (uint16_t)(got.stride * 4), 24, 32, fd);
-            xcb_generic_error_t* err = xcb_request_check(cn, ck);
-            if (err) { free(err); continue; }
-            s->pm[i] = cand;
+            wsi_import_fd(s, i, fd, (size_t)real, got.stride * 4);
         }
-        if (!s->pm[i]) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!WSI_HAS_BUF(s, i)) return VK_ERROR_INITIALIZATION_FAILED;
 
         VkAndroidHardwareBufferFormatPropertiesANDROID fp = {
             .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID };
@@ -1118,10 +1439,10 @@ static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* c
         VkExternalMemoryImageCreateInfo emi = {
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID };
-        
-        VkFormat vf[] = { 
-            VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB, 
-            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB 
+
+        VkFormat vf[] = {
+            VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB,
+            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB
         };
         VkImageFormatListCreateInfo fl = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
             .pNext = &emi, .viewFormatCount = sizeof(vf)/sizeof(vf[0]), .pViewFormats = vf };
@@ -1148,7 +1469,7 @@ static VkResult wsi_build_zc(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* c
     }
     s->zc = 1;
 
-    if (!getenv("VULKAN_SYNC") && w.GetSemaphoreFdKHR) {
+    if (!getenv("VULKAN_SYNC") && w.GetSemaphoreFdKHR && s->surf->kind == WSI_XCB) {
         VkExportSemaphoreCreateInfo esi = {
             .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
             .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT };
@@ -1271,8 +1592,76 @@ static VkResult wsi_build_cpu(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* 
         if ((r = w.EndCommandBuffer(s->cmd[i]))) return r;
     }
     s->zc = 0;
-    wsi_shm_setup(s);
+    if (s->surf->kind == WSI_XCB) wsi_shm_setup(s);
+    else if (s->surf->kind == WSI_WAYLAND && (r = wsi_wl_shm_setup(s))) return r;
     return VK_SUCCESS;
+}
+
+/* Allocate swapchain images only for non-dump headless rendering */
+static VkResult wsi_build_headless(wsi_swapchain* s, const VkSwapchainCreateInfoKHR* ci) {
+    VkDevice dev = s->dev;
+    VkResult r;
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if ((r = w.CreateFence(dev, &fci, NULL, &s->fence))) return r;
+
+    int mut = (ci->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) != 0;
+    VkImageFormatListCreateInfo mfl; int have_mfl = 0;
+    for (const VkBaseInStructure* p = (const VkBaseInStructure*)ci->pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            mfl = *(const VkImageFormatListCreateInfo*)p;
+            mfl.pNext = NULL;
+            have_mfl = 1;
+            break;
+        }
+
+    for (uint32_t i = 0; i < s->n; i++) {
+        VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = (mut && have_mfl) ? &mfl : NULL,
+            .flags = mut ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
+            .imageType = VK_IMAGE_TYPE_2D, .format = s->fmt,
+            .extent = { s->ext.width, s->ext.height, 1 }, .mipLevels = 1, .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = ci->imageUsage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        if ((r = w.CreateImage(dev, &ici, NULL, &s->img[i]))) return r;
+        VkMemoryRequirements ir; w.GetImageMemoryRequirements(dev, s->img[i], &ir);
+        uint32_t it = wsi_find_mem(ir.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (it == UINT32_MAX) it = wsi_find_mem(ir.memoryTypeBits, 0);
+        if (it == UINT32_MAX) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        VkMemoryAllocateInfo iai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = ir.size, .memoryTypeIndex = it };
+        if ((r = w.AllocateMemory(dev, &iai, NULL, &s->imem[i]))) return r;
+        if ((r = w.BindImageMemory(dev, s->img[i], s->imem[i], 0))) return r;
+    }
+    s->zc = 0;
+    return VK_SUCCESS;
+}
+
+/* Write mapped BGRA/RGBA frame buffer to a binary PPM file */
+static void wsi_dump_ppm(wsi_swapchain* s, uint32_t idx) {
+    const char* dir = getenv("VULKAN_HEADLESS_DUMP");
+    if (!dir || !*dir || !s->map[idx]) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/frame_%06u.ppm", dir, s->dump_n++);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    uint32_t W = s->ext.width, H = s->ext.height;
+    int bgr = s->fmt == VK_FORMAT_B8G8R8A8_UNORM || s->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    uint8_t* row = malloc((size_t)W * 3);
+    if (row) {
+        fprintf(f, "P6\n%u %u\n255\n", W, H);
+        for (uint32_t y = 0; y < H; y++) {
+            const uint8_t* src = s->map[idx] + (size_t)y * W * 4;
+            for (uint32_t x = 0; x < W; x++) {
+                row[x * 3 + 0] = src[x * 4 + (bgr ? 2 : 0)];
+                row[x * 3 + 1] = src[x * 4 + 1];
+                row[x * 3 + 2] = src[x * 4 + (bgr ? 0 : 2)];
+            }
+            fwrite(row, 1, (size_t)W * 3, f);
+        }
+        free(row);
+    }
+    fclose(f);
 }
 
 static VkResult VKAPI_CALL wsi_CreateSwapchainKHR(VkDevice dev,
@@ -1290,7 +1679,10 @@ static VkResult VKAPI_CALL wsi_CreateSwapchainKHR(VkDevice dev,
     wsi_setup(s, dev, ci);
     if (!s->surf) { free(s); return VK_ERROR_SURFACE_LOST_KHR; }
 
-    int force_cpu = getenv("VULKAN_CPU") != NULL;
+    int headless = s->surf->kind == WSI_HEADLESS;
+    const char* hd = getenv("VULKAN_HEADLESS_DUMP");
+    int dump = headless && hd && *hd;
+    int force_cpu = headless || getenv("VULKAN_CPU") != NULL;
     VkResult r = force_cpu ? VK_ERROR_FEATURE_NOT_PRESENT : wsi_build_zc(s, ci);
     if (r) {
         if (!force_cpu && wsi_dbg_enabled()) {
@@ -1299,18 +1691,21 @@ static VkResult VKAPI_CALL wsi_CreateSwapchainKHR(VkDevice dev,
         wsi_stop_worker(s);
         wsi_release(s);
         wsi_setup(s, dev, ci);
-        r = wsi_build_cpu(s, ci);
+        r = (headless && !dump) ? wsi_build_headless(s, ci) : wsi_build_cpu(s, ci);
     }
-    if (r) {
+        if (r) {
         fprintf(stderr, "vulkan_error:: CreateSwapchain failed (%d)\n", r);
         wsi_free_swapchain(s);
         return r;
     }
     if (wsi_dbg_enabled()) {
         const char* src = g_dh.on ? "dma-buf" : "AHB";
+        const char* disp = s->surf->kind == WSI_WAYLAND ? "linux-dmabuf" : "DRI3";
         char mode[64];
-        if (s->zc) snprintf(mode, sizeof mode, "ZERO-COPY %s (%s + DRI3)", s->async ? "async" : "sync", src);
-        else       snprintf(mode, sizeof mode, "CPU copy%s", s->shm_ptr ? " (MIT-SHM)" : "");
+        if (headless) snprintf(mode, sizeof mode, "HEADLESS%s", dump ? " (PPM dump)" : "");
+        else if (s->zc) snprintf(mode, sizeof mode, "ZERO-COPY %s (%s + %s)",
+                                 s->async ? "async" : "sync", src, disp);
+        else          snprintf(mode, sizeof mode, "CPU copy%s", s->shm_ptr ? " (MIT-SHM)" : "");
         fprintf(stderr, "vulkan_debug: mode %s, %u images %ux%u\n", mode, s->n, s->ext.width, s->ext.height);
     }
     *out = (VkSwapchainKHR)(uintptr_t)s;
@@ -1373,6 +1768,9 @@ static VkResult VKAPI_CALL wsi_AcquireNextImageKHR(VkDevice d, VkSwapchainKHR sc
         s->next = ((uint32_t)k + 1) % s->n;
         pthread_mutex_unlock(&s->mu);
         *idx = (uint32_t)k;
+    } else if (s->surf->kind == WSI_WAYLAND) {
+        VkResult wr = wsi_wl_acquire(s, timeout, idx);
+        if (wr) return wr;
     } else {
         *idx = s->next;
         s->next = (s->next + 1) % s->n;
@@ -1390,11 +1788,11 @@ static void wsi_put(wsi_swapchain* s, const uint8_t* px) {
 
     if (s->shm_ptr) {
         memcpy(s->shm_ptr, px, s->shm_size);
-xcb_shm_put_image(sf->conn, sf->win, sf->gc,
-                  s->ext.width, s->ext.height,
-                  0, 0, s->ext.width, s->ext.height,
-                  0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP,
-                  0 /* send_event */, s->shm_seg, 0 /* offset */);
+        xcb_shm_put_image(sf->conn, sf->win, sf->gc,
+                          s->ext.width, s->ext.height,
+                          0, 0, s->ext.width, s->ext.height,
+                          0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                          0, s->shm_seg, 0);
         xcb_flush(sf->conn);
         free(xcb_get_input_focus_reply(sf->conn, xcb_get_input_focus(sf->conn), NULL));
         return;
@@ -1429,7 +1827,7 @@ static VkResult VKAPI_CALL wsi_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR
     for (const VkBaseInStructure* p = (const VkBaseInStructure*)pi->pNext; p; p = p->pNext)
         if (p->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR)
             pfi = (const VkSwapchainPresentFenceInfoKHR*)p;
-  
+
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         wsi_swapchain* s = (wsi_swapchain*)WSI_H2P(pi->pSwapchains[i]);
         uint32_t idx = pi->pImageIndices[i];
@@ -1448,8 +1846,8 @@ static VkResult VKAPI_CALL wsi_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR
             .pWaitSemaphores = pi->pWaitSemaphores, .pWaitDstStageMask = stages,
             .signalSemaphoreCount = s->async ? 1 : 0,
             .pSignalSemaphores = s->async ? &s->isemaphore[idx] : NULL,
-            .commandBufferCount = s->zc ? 0 : 1,
-            .pCommandBuffers = s->zc ? NULL : &s->cmd[idx] };
+            .commandBufferCount = s->cmd[idx] ? 1 : 0,
+            .pCommandBuffers = s->cmd[idx] ? &s->cmd[idx] : NULL };
 
         if (s->async) {
             VkFence sf = (pi->swapchainCount == 1) ? pf : VK_NULL_HANDLE;
@@ -1476,7 +1874,7 @@ static VkResult VKAPI_CALL wsi_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR
                 pthread_cond_broadcast(&s->cv);
                 pthread_mutex_unlock(&s->mu);
             }
-            
+
             if (!sf || r) wsi_signal_present_fence(q, pf);
             if (pi->pResults) pi->pResults[i] = r;
             if (r && (!worst || (r < 0 && worst > 0))) worst = r;
@@ -1487,7 +1885,18 @@ static VkResult VKAPI_CALL wsi_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR
         r = w.QueueSubmit(q, 1, &si, s->fence);
         if (!r) r = w.WaitForFences(s->dev, 1, &s->fence, VK_TRUE, 5000000000ull);
         if (!r) {
-            if (s->zc) {
+            if (s->surf->kind == WSI_HEADLESS) {
+                if (s->map[idx]) {
+                    if (!s->coherent) {
+                        VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                            .memory = s->bmem[idx], .offset = 0, .size = VK_WHOLE_SIZE };
+                        w.InvalidateMappedMemoryRanges(s->dev, 1, &mr);
+                    }
+                    wsi_dump_ppm(s, idx);
+                }
+            } else if (s->surf->kind == WSI_WAYLAND) {
+                wsi_wl_present(s, idx);
+            } else if (s->zc) {
                 xcb_copy_area(s->surf->conn, s->pm[idx], s->surf->win, s->surf->gc,
                               0, 0, 0, 0, s->ext.width, s->ext.height);
                 xcb_flush(s->surf->conn);
@@ -1500,6 +1909,8 @@ static VkResult VKAPI_CALL wsi_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR
                 wsi_put(s, s->map[idx]);
             }
         }
+        if (r && s->surf->kind == WSI_WAYLAND)
+            __atomic_store_n(&s->wl_state[idx], 0, __ATOMIC_RELEASE);
         wsi_signal_present_fence(q, pf);
         if (pi->pResults) pi->pResults[i] = r;
         if (r && (!worst || (r < 0 && worst > 0))) worst = r;
@@ -1507,8 +1918,7 @@ static VkResult VKAPI_CALL wsi_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR
     return worst;
 }
 
-/* =====================  EXTENSIONS + INSTANCE/DEVICE  ===================== */
-
+/* Extensions and entry points */
 static int wsi_load(mali_ctx* c);
 
 #ifdef WSI_XLIB
@@ -1670,6 +2080,8 @@ static const VkExtensionProperties wsi_adv_inst[] = {
     { "VK_KHR_surface_maintenance1", 1 },
     { "VK_EXT_surface_maintenance1", 1 },
     { "VK_KHR_surface", 25 }, { "VK_KHR_xcb_surface", 6 },
+    { "VK_KHR_wayland_surface", 6 },
+    { "VK_EXT_headless_surface", 1 },
     { "VK_KHR_get_surface_capabilities2", 1 },
     { "VK_EXT_debug_report", 10 }, { "VK_EXT_debug_utils", 2 },
     { "VK_EXT_tooling_info", 1 },
@@ -1748,7 +2160,7 @@ static VkResult VKAPI_CALL wsi_EnumerateDeviceExtensionProperties(VkPhysicalDevi
 
 static PFN_vkVoidFunction VKAPI_CALL wsi_real_driver_gipa(VkInstance instance, const char* pName) {
     if (!pName) return NULL;
-    
+
     if (!strcmp(pName, "vkCreateInstance")) {
         return (PFN_vkVoidFunction)g_c->hal->CreateInstance;
     }
@@ -1757,7 +2169,7 @@ static PFN_vkVoidFunction VKAPI_CALL wsi_real_driver_gipa(VkInstance instance, c
         VkInstance inst = instance ? instance : (g_c ? g_c->inst : VK_NULL_HANDLE);
         return g_real_gipa ? g_real_gipa(inst, "vkCreateDevice") : NULL;
     }
-    
+
     VkInstance inst = instance ? instance : (g_c ? g_c->inst : VK_NULL_HANDLE);
     return g_real_gipa ? g_real_gipa(inst, pName) : NULL;
 }
@@ -1765,13 +2177,13 @@ static PFN_vkVoidFunction VKAPI_CALL wsi_real_driver_gipa(VkInstance instance, c
 static PFN_vkVoidFunction VKAPI_CALL wsi_real_driver_gdpa(VkDevice device, const char* pName) {
     if (!pName) return NULL;
     PFN_vkGetDeviceProcAddr real_gdpa = wsi_real_gdpa_get();
-    
+
     if (!strcmp(pName, "vkCreateDevice")) {
-        return real_gdpa ? real_gdpa(device, "vkCreateDevice") 
+        return real_gdpa ? real_gdpa(device, "vkCreateDevice")
                          : g_real_gipa(g_c->inst, "vkCreateDevice");
     }
-    
-    return real_gdpa ? real_gdpa(device, pName) 
+
+    return real_gdpa ? real_gdpa(device, pName)
                      : (g_c ? g_real_gipa(g_c->inst, pName) : NULL);
 }
 
@@ -1970,8 +2382,7 @@ static VkResult VKAPI_CALL wsi_GetPhysicalDeviceToolPropertiesEXT(
     return VK_SUCCESS;
 }
 
-/* =====================  VULKAN 1.2 TIMELINE SEMAPHORE ALIASES  ===================== */
-
+/* Vulkan 1.2 timeline semaphore entry point aliases */
 typedef VkResult (VKAPI_PTR *PFN_vkWaitSemaphoresKHR)(VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo, uint64_t timeout);
 typedef VkResult (VKAPI_PTR *PFN_vkSignalSemaphoreKHR)(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo);
 typedef VkResult (VKAPI_PTR *PFN_vkGetSemaphoreCounterValueKHR)(VkDevice device, VkSemaphore semaphore, uint64_t* pValue);
@@ -2018,7 +2429,18 @@ static VkResult VKAPI_CALL wsi_ReleaseSwapchainImagesKHR(VkDevice d,
         const VkReleaseSwapchainImagesInfoKHR* ri) {
     (void)d;
     wsi_swapchain* s = (wsi_swapchain*)WSI_H2P(ri->swapchain);
-    if (!s || !s->async) return VK_SUCCESS;
+    if (!s) return VK_SUCCESS;
+    if (s->surf && s->surf->kind == WSI_WAYLAND) {
+        for (uint32_t i = 0; i < ri->imageIndexCount; i++) {
+            uint32_t idx = ri->pImageIndices[i];
+            int exp = 1;
+            if (idx < s->n)
+                __atomic_compare_exchange_n(&s->wl_state[idx], &exp, 0, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        }
+        return VK_SUCCESS;
+    }
+    if (!s->async) return VK_SUCCESS;
     pthread_mutex_lock(&s->mu);
     for (uint32_t i = 0; i < ri->imageIndexCount; i++) {
         uint32_t idx = ri->pImageIndices[i];
@@ -2029,8 +2451,7 @@ static VkResult VKAPI_CALL wsi_ReleaseSwapchainImagesKHR(VkDevice d,
     return VK_SUCCESS;
 }
 
-/* =====================  DISPATCH  ===================== */
-
+/* Dispatch tables */
 typedef struct { const char* n; PFN_vkVoidFunction f; } wsi_ov;
 
 #define OV(name, fn) { name, (PFN_vkVoidFunction)(fn) }
@@ -2039,6 +2460,9 @@ static const wsi_ov wsi_inst_ov[] = {
     OV("vkGetInstanceProcAddr",                      wsi_core_gipa),
     OV("vkGetDeviceProcAddr",                        wsi_core_gdpa),
     OV("vkCreateXcbSurfaceKHR",                      wsi_CreateXcbSurfaceKHR),
+    OV("vkCreateWaylandSurfaceKHR",                       wsi_CreateWaylandSurfaceKHR),
+    OV("vkGetPhysicalDeviceWaylandPresentationSupportKHR", wsi_GetWaylandPresentationSupportKHR),
+    OV("vkCreateHeadlessSurfaceEXT",                 wsi_CreateHeadlessSurfaceEXT),
     OV("vkCreateInstance",                           wsi_CreateInstance),
     OV("vkGetPhysicalDeviceToolPropertiesEXT",       wsi_GetPhysicalDeviceToolPropertiesEXT),
     OV("vkGetPhysicalDeviceToolProperties",          wsi_GetPhysicalDeviceToolPropertiesEXT),
