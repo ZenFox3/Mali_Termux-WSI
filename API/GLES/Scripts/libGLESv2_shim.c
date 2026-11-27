@@ -1,13 +1,14 @@
 /*
- * libGLESv2_shim.c - Universal shim for GLES 1.x / 2.0 / 3.x over Mali SPHAL
- * with direct WSI: AHardwareBuffer (linear dma-buf) + DRI3 + Present (IDLE_NOTIFY), zero CPU copy.
+ * libGLESv2_shim.c - OpenGL ES 1.x / 2.0 / 3.x shim over Mali SPHAL
+ * with zero-copy X11 WSI via AHardwareBuffer (linear dma-buf), DRI3, and Present.
  *
- * Pipeline: app -> offscreen FBO -> GPU pass (flip Y + swizzle) -> AHB -> DRI3 pixmap -> Present
- * Lazy initialization (first glBindFramebuffer(0) or first eglSwapBuffers with GLES3 context).
+ * Render path: app -> offscreen FBO -> Y-flip/swizzle pass -> AHB -> DRI3 pixmap -> Present
+ * Initialized lazily on first default framebuffer bind or GLES3 swap when not delegated to EGL shim.
  *
  * Link: -ldl -lxcb -lxcb-dri3 -lxcb-present
  * Env:  GL_DEBUG=1 | SHIM_DMABUF=0 | SHIM_SYNC=flush | SHIM_PRESENT_COPY=1 | SHIM_FORMAT=1|5
- *       SHIM_W / SHIM_H (default 1280x720) | SHIM_REAL_SWAP=1 (also call real eglSwapBuffers)
+ *       SHIM_W / SHIM_H (default 1280x720) | SHIM_REAL_SWAP=1 | SHIM_NORM16=0|1|2
+ *       SHIM_NORM16_FMT=half|float | GLX_LASTFN=1
  */
 #define _GNU_SOURCE
 #include "../Include/mali_sphal.h"
@@ -22,6 +23,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
 
 typedef unsigned int EGLBoolean;
 typedef void* EGLDisplay;
@@ -43,7 +47,7 @@ typedef void* EGLSurface;
 
 #define NUM_BUF 3
 
-/* ---------- GL Constants ---------- */
+/* OpenGL ES constants */
 #define C_TEXTURE_2D        0x0DE1
 #define C_FRAMEBUFFER       0x8D40
 #define C_RENDERBUFFER      0x8D41
@@ -60,6 +64,7 @@ typedef void* EGLSurface;
 #define C_RGBA              0x1908
 #define C_UBYTE             0x1401
 #define C_FLOAT             0x1406
+#define C_HALF_FLOAT        0x140B
 #define C_NEAREST           0x2600
 #define C_MIN_FILTER        0x2801
 #define C_MAG_FILTER        0x2800
@@ -89,17 +94,16 @@ typedef void* EGLSurface;
 #define C_LINK_STATUS       0x8B82
 #define C_VERSION           0x1F02
 
-/* ---------- Debug Logging Helper ---------- */
 static inline int gles_debug_enabled(void) {
     const char* env_gl = getenv("GL_DEBUG");
     const char* env_mali = getenv("MALI_DEBUG");
     const char* env_egl = getenv("EGL_DEBUG");
-    return (env_gl && env_gl[0] != '0') || 
-           (env_mali && env_mali[0] != '0') || 
+    return (env_gl && env_gl[0] != '0') ||
+           (env_mali && env_mali[0] != '0') ||
            (env_egl && env_egl[0] != '0');
 }
 
-/* ---------- AHardwareBuffer (manual declarations) ---------- */
+/* AHardwareBuffer declarations (loaded dynamically from libnativewindow.so) */
 typedef struct {
     uint32_t width, height, layers, format;
     uint64_t usage;
@@ -108,7 +112,8 @@ typedef struct {
 } AHBDesc;
 typedef struct { int version, numFds, numInts; int data[]; } native_handle_t;
 
-#define AHB_USAGE_CPU_READ_RARELY 0x2ULL   /* forces linear layout (no AFBC) */
+/* CPU_READ_RARELY avoids AFBC compression so DRI3 can import a linear buffer */
+#define AHB_USAGE_CPU_READ_RARELY 0x2ULL
 #define AHB_USAGE_GPU_SAMPLED     0x100ULL
 #define AHB_USAGE_GPU_COLOR_OUT   0x200ULL
 
@@ -137,7 +142,6 @@ static int ahb_init(void) {
     return ahb_state > 0 ? 0 : -1;
 }
 
-/* ---------- Global State ---------- */
 typedef struct {
     void* ab;
     xcb_pixmap_t pixmap;
@@ -164,17 +168,15 @@ static xcb_connection_t* g_conn;
 static xcb_window_t g_win;
 static xcb_special_event_t* g_se;
 
-/* 1. Internal pointer table to real Mali driver */
+/* Resolved pointers to underlying Mali driver entry points */
 #define X(n) HIDDEN void* p_##n;
 #include "../Include/gles_list.h"
 #undef X
 
-#include <signal.h>
-
 HIDDEN const char* gl_last_fn;
 HIDDEN int gl_trace_flag;
 
-/* Called by a trampoline whose Mali target is NULL */
+/* Fallback when an exported GL entry point is missing in the Mali driver */
 HIDDEN long gl_null_call(const char* n) {
     static int cnt;
     if (cnt < 64) {
@@ -194,7 +196,35 @@ HIDDEN void* gl_rp_missing(const char* n) {
     return (void*)gl_rp_dummy;
 }
 
-/* 2. AArch64 trampolines: optional last-call tracking; NULL target -> log + return 0 */
+#include "gl_essl_ext.c"
+
+/* Rename intercepted entry points during trampoline generation so custom wrappers can export them */
+#ifndef GLX_SHIM_BUILD
+#undef glGetString
+#undef glGetStringi
+#undef glGetIntegerv
+#undef glTexImage2D
+#undef glTexSubImage2D
+#undef glTexImage3D
+#undef glTexSubImage3D
+#undef glTexStorage2D
+#undef glTexStorage3D
+#undef glRenderbufferStorage
+#undef glReadPixels
+#define glGetString           shim_tramp_glGetString
+#define glGetStringi          shim_tramp_glGetStringi
+#define glGetIntegerv         shim_tramp_glGetIntegerv
+#define glTexImage2D          shim_tramp_glTexImage2D
+#define glTexSubImage2D       shim_tramp_glTexSubImage2D
+#define glTexImage3D          shim_tramp_glTexImage3D
+#define glTexSubImage3D       shim_tramp_glTexSubImage3D
+#define glTexStorage2D        shim_tramp_glTexStorage2D
+#define glTexStorage3D        shim_tramp_glTexStorage3D
+#define glRenderbufferStorage shim_tramp_glRenderbufferStorage
+#define glReadPixels          shim_tramp_glReadPixels
+#endif
+
+/* AArch64 branch trampolines with optional call tracing and NULL-target guard */
 #define X(n)                                                  \
     EXPORT __attribute__((naked)) void n(void) {              \
         __asm__ volatile(                                     \
@@ -221,13 +251,24 @@ HIDDEN void* gl_rp_missing(const char* n) {
 #include "../Include/gles_list.h"
 #undef X
 
-/* ---- crash handler: prints the last traced GL call, then chains to the previous handler ---- */
+#ifndef GLX_SHIM_BUILD
+#undef glGetString
+#undef glGetStringi
+#undef glGetIntegerv
+#undef glTexImage2D
+#undef glTexSubImage2D
+#undef glTexImage3D
+#undef glTexSubImage3D
+#undef glTexStorage2D
+#undef glTexStorage3D
+#undef glRenderbufferStorage
+#undef glReadPixels
+#endif
+
 static struct sigaction gl_old_sa[2];
 static const int gl_crash_sigs[2] = { SIGSEGV, SIGBUS };
 
-#include <ucontext.h>
-#include <sys/syscall.h>
-
+/* Log last traced GL call on fatal signal before chaining to previous handler */
 static void gl_crash_h(int sig, siginfo_t* si, void* vuc) {
     ucontext_t* uc = (ucontext_t*)vuc;
     unsigned long pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30], sp = uc->uc_mcontext.sp;
@@ -250,7 +291,7 @@ static void gl_crash_h(int sig, siginfo_t* si, void* vuc) {
     raise(sig);
 }
 
-/* Blender installs its own handler after our constructor, so this is called again from glXMakeContextCurrent */
+/* Re-install signal handler if an application/host overwrites it after init */
 HIDDEN void gl_crash_install(void) {
     if (!gl_trace_flag) return;
     for (int i = 0; i < 2; i++) {
@@ -271,7 +312,21 @@ static void (*real_bind)(unsigned, unsigned);
 static void (*real_bind_oes)(unsigned, unsigned);
 static EGLBoolean (*real_swap_buffers)(EGLDisplay, EGLSurface);
 
-/* ---------- Internal GL functions (bypass exports) ---------- */
+static const unsigned char* (*real_glGetString)(unsigned);
+static const unsigned char* (*real_glGetStringi)(unsigned, unsigned);
+static void     (*real_glGetIntegerv)(unsigned, int*);
+static unsigned (*real_glGetError)(void);
+static void     (*real_glPixelStorei)(unsigned, int);
+static void     (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*);
+static void     (*real_glTexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*);
+static void     (*real_glTexImage3D)(unsigned, int, int, int, int, int, int, unsigned, unsigned, const void*);
+static void     (*real_glTexSubImage3D)(unsigned, int, int, int, int, int, int, int, unsigned, unsigned, const void*);
+static void     (*real_glTexStorage2D)(unsigned, int, unsigned, int, int);
+static void     (*real_glTexStorage3D)(unsigned, int, unsigned, int, int, int);
+static void     (*real_glRenderbufferStorage)(unsigned, unsigned, int, int);
+static void     (*real_glReadPixels)(int, int, int, int, unsigned, unsigned, void*);
+
+/* Direct GL function table used internally by WSI and probing without recursion */
 typedef struct {
     void (*genTextures)(int, unsigned*);
     void (*deleteTextures)(int, const unsigned*);
@@ -365,7 +420,6 @@ static int gl_load(void) {
     return miss ? -1 : 0;
 }
 
-/* ---------- X11 / Present Utilities ---------- */
 __attribute__((unused)) static long now_ms(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
@@ -377,6 +431,7 @@ static void x_sync(void) {
     while ((e = xcb_poll_for_event(g_conn))) free(e);
 }
 
+/* Worker thread synchronizes GPU completion and submits X11 Present requests */
 static pthread_t g_th;
 static int g_th_started, g_stop, g_qhead, g_qcount, g_inflight;
 static pthread_mutex_t g_mu;
@@ -449,6 +504,7 @@ static void* present_worker(void* arg) {
             else g_inflight++;
             continue;
         }
+        /* Poll idle notifications periodically while frames are in flight */
         if (g_inflight > 0 && !g_no_idle) {
             struct timespec ts; ms_deadline(&ts, 1);
             pthread_cond_timedwait(&g_cv_job, &g_mu, &ts);
@@ -505,6 +561,7 @@ static int acquire_slot(void) {
         struct timespec ts; ms_deadline(&ts, 300);
         while ((k = first_free()) < 0) {
             if (pthread_cond_timedwait(&g_cv_free, &g_mu, &ts) == ETIMEDOUT) {
+                /* Fall back to unthrottled reuse if X server never emits IDLE_NOTIFY */
                 if (gles_debug_enabled()) {
                     fprintf(stderr, "[gles-shim] Present: Server not sending IDLE_NOTIFY, continuing without wait\n");
                 }
@@ -524,13 +581,13 @@ static int acquire_slot(void) {
 static int x_setup(void) {
     g_conn = xcb_connect(NULL, NULL);
     if (!g_conn || xcb_connection_has_error(g_conn)) {
-        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] No X11 connection\n"); 
+        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] No X11 connection\n");
         g_conn = NULL; return -1;
     }
     const xcb_query_extension_reply_t* e3 = xcb_get_extension_data(g_conn, &xcb_dri3_id);
     const xcb_query_extension_reply_t* ep = xcb_get_extension_data(g_conn, &xcb_present_id);
     if (!e3 || !e3->present || !ep || !ep->present) {
-        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] DRI3/Present extension missing\n"); 
+        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] DRI3/Present extension missing\n");
         return -1;
     }
     xcb_dri3_query_version_reply_t* r3 =
@@ -555,21 +612,21 @@ static int x_setup(void) {
     xcb_void_cookie_t ck = xcb_present_select_input_checked(
         g_conn, g_eid, g_win, XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
     xcb_generic_error_t* err = xcb_request_check(g_conn, ck);
-    if (err || !g_se) { 
-        free(err); 
-        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] present_select_input failed\n"); 
-        return -1; 
+    if (err || !g_se) {
+        free(err);
+        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] present_select_input failed\n");
+        return -1;
     }
     return 0;
 }
 
-/* ---------- Save / Restore GL State ---------- */
 typedef struct {
     int act, tex0, samp, draw_fb, read_fb, rb, arr, vao, prog, vp[4], cm[4];
     int en[5];
 } gl_saved;
 static const unsigned EN_CAPS[5] = { C_SCISSOR_TEST, C_DEPTH_TEST, C_STENCIL_TEST, C_BLEND, C_CULL_FACE };
 
+/* Preserve caller GL state across internal FBO blit passes */
 static void gl_save(gl_saved* st) {
     GL.getIntegerv(C_ACTIVE_TEXTURE, &st->act);
     GL.activeTexture(C_TEXTURE0);
@@ -602,7 +659,6 @@ static void gl_restore(const gl_saved* st) {
     GL.activeTexture(st->act);
 }
 
-/* ---------- Blit Shader (flip Y + optional swizzle + alpha=1) ---------- */
 static unsigned compile_sh(unsigned type, const char* src) {
     unsigned sh = GL.createShader(type);
     GL.shaderSource(sh, 1, &src, NULL);
@@ -618,6 +674,7 @@ static unsigned compile_sh(unsigned type, const char* src) {
     return sh;
 }
 
+/* Fullscreen blit shader flipping Y for X11 top-left coordinates and optional RGB/BGR swizzle */
 static unsigned build_blit_program(int swz) {
     static const char* vs =
         "#version 300 es\n"
@@ -652,7 +709,6 @@ static unsigned build_blit_program(int swz) {
     return p;
 }
 
-/* ---------- AHB ---------- */
 static void* alloc_ahb(int fmt, AHBDesc* out) {
     AHBDesc d = { .width = g_w, .height = g_h, .layers = 1, .format = fmt,
                   .usage = AHB_USAGE_GPU_COLOR_OUT | AHB_USAGE_GPU_SAMPLED | AHB_USAGE_CPU_READ_RARELY };
@@ -673,7 +729,6 @@ static int pick_dmabuf_fd(const native_handle_t* nh) {
     return nh->numFds > 1 ? nh->data[1] : -1;
 }
 
-/* ---------- Teardown ---------- */
 static void wsi_teardown(int with_gl) {
     worker_stop();
     if (with_gl && gl_loaded > 0) {
@@ -706,7 +761,7 @@ static void wsi_teardown(int with_gl) {
     g_inited = 0;
 }
 
-/* ---------- EGLImage from AHB ---------- */
+/* Try Android native buffer import variants first, then Linux dma-buf import */
 static void* make_egl_image(void* ab, void* (*get_cb)(void*), int fd, int w, int h,
                             uint32_t stride, int fmt, int verbose) {
     int (*get_err)(void) = (int (*)(void))dlsym(G_mali, "eglGetError");
@@ -746,9 +801,9 @@ static void* make_egl_image(void* ab, void* (*get_cb)(void*), int fd, int w, int
     int da[] = { 0x3057, w, 0x3056, h, 0x3271, fourcc, 0x3272, fd,
                  0x3273, 0, 0x3274, (int)stride, 0x30D2 /* EGL_IMAGE_PRESERVED_KHR */, 1, 0x3038 };
     void* img = m_eglCreateImageKHR(g_dpy, NULL, 0x3270 /* EGL_LINUX_DMA_BUF_EXT */, NULL, da);
-    if (img) { 
-        if (verbose && gles_debug_enabled()) fprintf(stderr, "[gles-shim] EGLImage via dma_buf_import\n"); 
-        return img; 
+    if (img) {
+        if (verbose && gles_debug_enabled()) fprintf(stderr, "[gles-shim] EGLImage via dma_buf_import\n");
+        return img;
     }
     if (verbose && gles_debug_enabled()) {
         fprintf(stderr, "[gles-shim] dma_buf_import failed: eglError=0x%x\n", get_err ? get_err() : 0);
@@ -756,7 +811,7 @@ static void* make_egl_image(void* ab, void* (*get_cb)(void*), int fd, int w, int
     return NULL;
 }
 
-/* ---------- Build WSI ---------- */
+/* Allocate offscreen render target, blit shader, and per-slot AHB/DRI3/FBO resources */
 static int wsi_build(void) {
     void* (*get_cb)(void*) = real_gpa ? (void* (*)(void*))real_gpa("eglGetNativeClientBufferANDROID") : NULL;
     void (*img_target)(unsigned, void*) = (void (*)(unsigned, void*))glp("glEGLImageTargetTexture2DOES");
@@ -782,7 +837,7 @@ static int wsi_build(void) {
     GL.framebufferTexture2D(C_FRAMEBUFFER, C_COLOR_ATT0, C_TEXTURE_2D, g_app_tex, 0);
     GL.framebufferRenderbuffer(C_FRAMEBUFFER, C_DEPTH_STENCIL_ATT, C_RENDERBUFFER, g_app_rbo);
     if (GL.checkFramebufferStatus(C_FRAMEBUFFER) != C_FB_COMPLETE) {
-        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] Application FBO incomplete\n"); 
+        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] Application FBO incomplete\n");
         return -1;
     }
 
@@ -796,7 +851,7 @@ static int wsi_build(void) {
     GL.vertexAttribPointer(0, 2, C_FLOAT, 0, 0, NULL);
 
     const char* fe = getenv("SHIM_FORMAT");
-    int try_fmt[2] = { fe ? atoi(fe) : 5, 1 };   /* 5 = BGRA (native X), 1 = RGBA (+swizzle) */
+    int try_fmt[2] = { fe ? atoi(fe) : 5, 1 }; /* 5 = BGRA, 1 = RGBA */
     int nfmt = fe ? 1 : 2;
 
     for (int i = 0; i < NUM_BUF; i++) {
@@ -808,9 +863,9 @@ static int wsi_build(void) {
                 if (sl->ab) g_fmt = try_fmt[f];
             }
         } else sl->ab = alloc_ahb(g_fmt, &d);
-        if (!sl->ab) { 
-            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] AHB allocation failed (slot %d)\n", i); 
-            return -1; 
+        if (!sl->ab) {
+            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] AHB allocation failed (slot %d)\n", i);
+            return -1;
         }
         g_swz = (g_fmt != 5);
         if (i == 0 && gles_debug_enabled()) {
@@ -821,9 +876,9 @@ static int wsi_build(void) {
         const native_handle_t* nh = ahb_handle(sl->ab);
         if (!nh) return -1;
         int fd = pick_dmabuf_fd(nh);
-        if (fd < 0) { 
-            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] Cannot find dma-buf fd\n"); 
-            return -1; 
+        if (fd < 0) {
+            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] Cannot find dma-buf fd\n");
+            return -1;
         }
 
         uint32_t stride = d.stride * 4;
@@ -840,9 +895,9 @@ static int wsi_build(void) {
         }
 
         sl->image = make_egl_image(sl->ab, get_cb, fd, g_w, g_h, stride, g_fmt, i == 0);
-        if (!sl->image) { 
-            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] All EGLImage variants failed\n"); 
-            return -1; 
+        if (!sl->image) {
+            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] All EGLImage variants failed\n");
+            return -1;
         }
 
         GL.genTextures(1, &sl->tex);
@@ -854,7 +909,7 @@ static int wsi_build(void) {
         GL.bindFramebuffer(C_FRAMEBUFFER, sl->fbo);
         GL.framebufferTexture2D(C_FRAMEBUFFER, C_COLOR_ATT0, C_TEXTURE_2D, sl->tex, 0);
         if (GL.checkFramebufferStatus(C_FRAMEBUFFER) != C_FB_COMPLETE) {
-            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] FBO slot %d incomplete\n", i); 
+            if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] FBO slot %d incomplete\n", i);
             return -1;
         }
     }
@@ -863,7 +918,7 @@ static int wsi_build(void) {
     return g_prog ? 0 : -1;
 }
 
-/* Lazy Initialization. Returns 1 if zero-copy path is active for current context. */
+/* Lazy initialization: returns 1 if zero-copy path is active for the current GLES3 context */
 static int ensure_init(void) {
     if (g_inited) return m_eglGetCurrentContext && m_eglGetCurrentContext() == g_ctx;
     if (g_failed) return 0;
@@ -904,9 +959,9 @@ static int ensure_init(void) {
     GL.bindFramebuffer(C_FRAMEBUFFER, g_app_fbo);
     GL.viewport(0, 0, g_w, g_h);
     GL.scissor(0, 0, g_w, g_h);
-    if (worker_start()) { 
-        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] Failed to start worker thread\n"); 
-        wsi_teardown(1); g_failed = 1; return 0; 
+    if (worker_start()) {
+        if (gles_debug_enabled()) fprintf(stderr, "[gles-shim] Failed to start worker thread\n");
+        wsi_teardown(1); g_failed = 1; return 0;
     }
     g_inited = 1;
     if (gles_debug_enabled()) {
@@ -915,7 +970,7 @@ static int ensure_init(void) {
     return 1;
 }
 
-/* ---------- Swap ---------- */
+/* Composite offscreen FBO into next slot, synchronize GPU work, and enqueue Present */
 static void wsi_swap(void) {
     static int mode = -1;
     static void* (*create_sync)(void*, unsigned, const int*);
@@ -959,18 +1014,26 @@ static void wsi_swap(void) {
     } else if (mode == 1) GL.finish();
     else GL.flush();
 
+    int dropped = 0;
     pthread_mutex_lock(&g_mu);
-    sl->busy = 1;
-    g_q[(g_qhead + g_qcount) % NUM_BUF].slot = k;
-    g_q[(g_qhead + g_qcount) % NUM_BUF].sync = sync;
-    g_qcount++;
-    pthread_cond_signal(&g_cv_job);
+    if (g_qcount >= NUM_BUF) dropped = 1;
+    else {
+        sl->busy = 1;
+        int t = (g_qhead + g_qcount) % NUM_BUF;
+        g_q[t].slot = k; g_q[t].sync = sync;
+        g_qcount++;
+        pthread_cond_signal(&g_cv_job);
+    }
     pthread_mutex_unlock(&g_mu);
+    if (dropped) {
+        unsigned (*ds)(void*, void*) = (unsigned (*)(void*, void*))dlsym(G_mali, "eglDestroySyncKHR");
+        if (sync && ds) ds(g_dpy, sync);
+        return;
+    }
 
     g_current_slot = (k + 1) % NUM_BUF;
 }
 
-/* ---------- Library Initialization ---------- */
 __attribute__((constructor))
 static void gles_shim_init(void) {
     G_mali = mali_sphal_load(MALI_SPHAL_DEFAULT);
@@ -979,19 +1042,32 @@ static void gles_shim_init(void) {
 #define X(n) p_##n = dlsym(G_mali, #n);
 #include "../Include/gles_list.h"
 #undef X
+    essl_install_hooks();
 
-    *(void**)&real_bind         = dlsym(G_mali, "glBindFramebuffer");
-    *(void**)&real_bind_oes     = dlsym(G_mali, "glBindFramebufferOES");
-    *(void**)&real_swap_buffers = dlsym(G_mali, "eglSwapBuffers");
-    *(void**)&real_gpa          = dlsym(G_mali, "eglGetProcAddress");
-    *(void**)&m_eglGetCurrentContext = dlsym(G_mali, "eglGetCurrentContext");
-    *(void**)&m_eglGetCurrentDisplay = dlsym(G_mali, "eglGetCurrentDisplay");
-    *(void**)&m_eglCreateImageKHR    = dlsym(G_mali, "eglCreateImageKHR");
-    *(void**)&m_eglDestroyImageKHR   = dlsym(G_mali, "eglDestroyImageKHR");
+    *(void**)&real_bind                  = dlsym(G_mali, "glBindFramebuffer");
+    *(void**)&real_bind_oes              = dlsym(G_mali, "glBindFramebufferOES");
+    *(void**)&real_swap_buffers          = dlsym(G_mali, "eglSwapBuffers");
+    *(void**)&real_gpa                   = dlsym(G_mali, "eglGetProcAddress");
+    *(void**)&m_eglGetCurrentContext     = dlsym(G_mali, "eglGetCurrentContext");
+    *(void**)&m_eglGetCurrentDisplay     = dlsym(G_mali, "eglGetCurrentDisplay");
+    *(void**)&m_eglCreateImageKHR        = dlsym(G_mali, "eglCreateImageKHR");
+    *(void**)&m_eglDestroyImageKHR       = dlsym(G_mali, "eglDestroyImageKHR");
+    *(void**)&real_glGetString           = dlsym(G_mali, "glGetString");
+    *(void**)&real_glGetStringi          = dlsym(G_mali, "glGetStringi");
+    *(void**)&real_glGetIntegerv         = dlsym(G_mali, "glGetIntegerv");
+    *(void**)&real_glGetError            = dlsym(G_mali, "glGetError");
+    *(void**)&real_glPixelStorei         = dlsym(G_mali, "glPixelStorei");
+    *(void**)&real_glTexImage2D          = dlsym(G_mali, "glTexImage2D");
+    *(void**)&real_glTexSubImage2D       = dlsym(G_mali, "glTexSubImage2D");
+    *(void**)&real_glTexImage3D          = dlsym(G_mali, "glTexImage3D");
+    *(void**)&real_glTexSubImage3D       = dlsym(G_mali, "glTexSubImage3D");
+    *(void**)&real_glTexStorage2D        = dlsym(G_mali, "glTexStorage2D");
+    *(void**)&real_glTexStorage3D        = dlsym(G_mali, "glTexStorage3D");
+    *(void**)&real_glRenderbufferStorage = dlsym(G_mali, "glRenderbufferStorage");
+    *(void**)&real_glReadPixels          = dlsym(G_mali, "glReadPixels");
     { const char* t = getenv("GLX_LASTFN"); gl_trace_flag = t && atoi(t); gl_crash_install(); }
 }
 
-/* ---------- Exports ---------- */
 static unsigned own_default_fbo(void) {
     return ensure_init() ? g_app_fbo : 0;
 }
@@ -999,12 +1075,14 @@ static unsigned own_default_fbo(void) {
 static unsigned (*egl_fbo_fn)(void);
 static EGLBoolean (*egl_swap_fn)(EGLDisplay, EGLSurface);
 static int deleg = -1;
+
+/* Check if an active EGL shim owns default FBO and swap handling */
 static int delegated(void) {
     if (deleg > 0) return 1;
-    if (g_inited) return 0;            /* WSI propriu deja pornit, nu mai comutăm */
+    if (g_inited) return 0;
     void* fn = dlsym(RTLD_DEFAULT, "shim_x11_default_fbo");
     if (!fn) {
-        /* EGL încărcat cu RTLD_LOCAL: încearcă prin handle fără a-l încărca */
+        /* Probe already-loaded EGL handles without triggering a new dlopen */
         void* h = dlopen("libEGL.so.1", RTLD_NOW | RTLD_NOLOAD);
         if (!h) h = dlopen("libEGL.so", RTLD_NOW | RTLD_NOLOAD);
         if (h) fn = dlsym(h, "shim_x11_default_fbo");
@@ -1016,7 +1094,7 @@ static int delegated(void) {
                 fprintf(stderr, "[gles-shim] EGL shim detected: WSI inside GLES shim disabled\n");
             return 1;
         }
-        return 0;                      /* nu fixa -1/0, reîncearcă data viitoare */
+        return 0;
     }
     *(void**)&egl_fbo_fn = fn;
     Dl_info di;
@@ -1071,3 +1149,578 @@ EXPORT EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (real_swap_buffers) return real_swap_buffers(dpy, surface);
     return EGL_TRUE;
 }
+
+#ifndef GLX_SHIM_BUILD
+/* GL_EXT_texture_norm16 capability probing, extension string injection, and half/float emulation */
+#define C_GL_EXTENSIONS       0x1F03
+#define C_NUM_EXTENSIONS      0x821D
+#define C_RED                 0x1903
+#define C_RG                  0x8227
+#define C_RGB                 0x1907
+#define C_SHORT               0x1402
+#define C_USHORT              0x1403
+#define C_R16                 0x822A
+#define C_RG16                0x822C
+#define C_RGB16               0x8054
+#define C_RGBA16              0x805B
+#define C_R16_SN              0x8F98
+#define C_RG16_SN             0x8F99
+#define C_RGB16_SN            0x8F9A
+#define C_RGBA16_SN           0x8F9B
+#define C_R16F                0x822D
+#define C_RG16F               0x822F
+#define C_RGB16F              0x881B
+#define C_RGBA16F             0x881A
+#define C_R32F                0x822E
+#define C_RG32F               0x8230
+#define C_RGB32F              0x8815
+#define C_RGBA32F             0x8814
+#define C_UNPACK_ROW_LENGTH   0x0CF2
+#define C_UNPACK_SKIP_ROWS    0x0CF3
+#define C_UNPACK_SKIP_PIXELS  0x0CF4
+#define C_UNPACK_ALIGNMENT    0x0CF5
+#define C_PIXEL_UNPACK_BUFFER 0x88EF
+#define C_PIXEL_PACK_BUFFER   0x88ED
+#define C_READ_FB_BINDING_EXT 0x8CAA
+#define C_COLOR_ATT0_EXT      0x8CE0
+#define C_FB_ATT_OBJ_TYPE     0x8CD0
+#define C_FB_ATT_OBJ_NAME     0x8CD1
+#define C_TEXTURE_CONST       0x1702
+#define C_RENDERBUFFER_CONST  0x8D41
+#define C_TEX_INT_FMT         0x1003
+#define C_RB_INT_FMT          0x8D42
+
+static const char* NORM16_EXT = "GL_EXT_texture_norm16";
+static const char* EXT_COLOR_BUFFER_FLOAT = "GL_EXT_color_buffer_float";
+
+typedef struct {
+    int align, row_len, skip_px, skip_rows;
+} unpack_state;
+
+/* Use half-float (16F) by default for linear filtering compatibility, or float (32F) when requested */
+static int norm16_use_half(void) {
+    static int half_mode = -1;
+    if (half_mode >= 0) return half_mode;
+    const char* f = getenv("SHIM_NORM16_FMT");
+    if (f && strcasecmp(f, "float") == 0) return half_mode = 0;
+    return half_mode = 1;
+}
+
+static int has_ext_name(const char* name) {
+    if (!real_glGetStringi || !real_glGetIntegerv) return 0;
+    int n = 0;
+    real_glGetIntegerv(C_NUM_EXTENSIONS, &n);
+    for (int i = 0; i < n; i++) {
+        const char* s = (const char*)real_glGetStringi(C_GL_EXTENSIONS, (unsigned)i);
+        if (s && strcmp(s, name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int probe_fmt(unsigned ifmt, unsigned fmt, unsigned type, int renderable) {
+    unsigned t = 0, f = 0, err = 0;
+    int ok = 0, prev_tex = 0, prev_fb = 0;
+
+    while (real_glGetError()) {}
+    real_glGetIntegerv(C_TEX_BINDING_2D, &prev_tex);
+
+    GL.genTextures(1, &t);
+    GL.bindTexture(C_TEXTURE_2D, t);
+    GL.texImage2D(C_TEXTURE_2D, 0, ifmt, 4, 4, 0, fmt, type, NULL);
+    err = real_glGetError();
+    ok = (err == 0);
+
+    if (ok && renderable) {
+        real_glGetIntegerv(C_DRAW_FB_BINDING, &prev_fb);
+        GL.genFramebuffers(1, &f);
+        GL.bindFramebuffer(C_DRAW_FB, f);
+        GL.framebufferTexture2D(C_DRAW_FB, C_COLOR_ATT0, C_TEXTURE_2D, t, 0);
+        err = real_glGetError();
+        ok = (err == 0) && (GL.checkFramebufferStatus(C_DRAW_FB) == C_FB_COMPLETE);
+        if (!err) err = real_glGetError();
+        GL.bindFramebuffer(C_DRAW_FB, prev_fb);
+        GL.deleteFramebuffers(1, &f);
+    }
+
+    GL.bindTexture(C_TEXTURE_2D, prev_tex);
+    GL.deleteTextures(1, &t);
+    while (real_glGetError()) {}
+
+    if (!ok && gles_debug_enabled())
+        fprintf(stderr, "[gles-shim] norm16 probe failed: ifmt=0x%x err=0x%x\n", ifmt, err);
+
+    return ok;
+}
+
+/* State: -1 = uninitialized, 0 = disabled, 1 = native driver support, 2 = emulated (16F or 32F) */
+static int norm16_state(void) {
+    static int st = -1;
+    if (st >= 0) return st;
+    if (!real_glGetStringi || !real_glGetIntegerv || !real_glGetError || !real_glGetString) return st = 0;
+    if (!m_eglGetCurrentContext || !m_eglGetCurrentContext()) return 0;
+
+    const char* env = getenv("SHIM_NORM16");
+    if (env && !atoi(env)) return st = 0;
+
+    const char* ver = (const char*)real_glGetString(C_VERSION);
+    if (!ver || !strstr(ver, "OpenGL ES 3")) return st = 0;
+
+    if (has_ext_name(NORM16_EXT)) return st = 0;
+
+    /* Emulation requires GL_EXT_color_buffer_float for renderable norm16 targets */
+    if (!has_ext_name(EXT_COLOR_BUFFER_FLOAT)) {
+        if (gles_debug_enabled())
+            fprintf(stderr, "[gles-shim] EXT_texture_norm16 skipped: missing %s\n", EXT_COLOR_BUFFER_FLOAT);
+        return st = 0;
+    }
+
+    if (env && atoi(env) == 2) {
+        if (gles_debug_enabled())
+            fprintf(stderr, "[gles-shim] EXT_texture_norm16 FORCED (%s emulation)\n",
+                    norm16_use_half() ? "R16F/RGBA16F" : "R32F/RGBA32F");
+        return st = 2;
+    }
+
+    if (gl_load()) return st = 0;
+    int ok =
+        probe_fmt(C_R16,       C_RED,  C_USHORT, 1) &&
+        probe_fmt(C_RG16,      C_RG,   C_USHORT, 1) &&
+        probe_fmt(C_RGBA16,    C_RGBA, C_USHORT, 1) &&
+        probe_fmt(C_RGB16,     C_RGB,  C_USHORT, 0) &&
+        probe_fmt(C_R16_SN,    C_RED,  C_SHORT,  0) &&
+        probe_fmt(C_RG16_SN,   C_RG,   C_SHORT,  0) &&
+        probe_fmt(C_RGB16_SN,  C_RGB,  C_SHORT,  0) &&
+        probe_fmt(C_RGBA16_SN, C_RGBA, C_SHORT,  0);
+    if (ok) {
+        if (gles_debug_enabled())
+            fprintf(stderr, "[gles-shim] EXT_texture_norm16 ADVERTISED (probed ok)\n");
+        return st = 1;
+    }
+
+    unsigned emu_color = norm16_use_half() ? C_R16F       : C_R32F;
+    unsigned emu_rgba  = norm16_use_half() ? C_RGBA16F    : C_RGBA32F;
+    unsigned emu_type  = norm16_use_half() ? C_HALF_FLOAT : C_FLOAT;
+    int emu_ok = probe_fmt(emu_color, C_RED,  emu_type, 1) &&
+                 probe_fmt(emu_rgba,  C_RGBA, emu_type, 1);
+
+    if (gles_debug_enabled()) {
+        fprintf(stderr, "[gles-shim] norm16 emulation probe (%s): %s\n",
+                norm16_use_half() ? "half/16F" : "float/32F",
+                emu_ok ? "PASS" : "FAIL");
+    }
+    if (!emu_ok) {
+        if (gles_debug_enabled())
+            fprintf(stderr, "[gles-shim] EXT_texture_norm16 emulation failed, disabling extension\n");
+        return st = 0;
+    }
+
+    if (gles_debug_enabled())
+        fprintf(stderr, "[gles-shim] EXT_texture_norm16 not native, enabling %s emulation\n",
+                norm16_use_half() ? "R16F/RGBA16F" : "R32F/RGBA32F");
+    return st = 2;
+}
+
+static inline int norm16_needed(void)   { return norm16_state() > 0; }
+static inline int norm16_emulated(void) { return norm16_state() == 2; }
+
+static unsigned emu_ifmt(unsigned f) {
+    int use_half = norm16_use_half();
+    switch (f) {
+        case C_R16:    case C_R16_SN:    return use_half ? C_R16F    : C_R32F;
+        case C_RG16:   case C_RG16_SN:   return use_half ? C_RG16F   : C_RG32F;
+        case C_RGB16:  case C_RGB16_SN:  return use_half ? C_RGB16F  : C_RGB32F;
+        case C_RGBA16: case C_RGBA16_SN: return use_half ? C_RGBA16F : C_RGBA32F;
+    }
+    return 0;
+}
+
+static uint16_t float_to_half_bits(float val) {
+    uint32_t bits = 0;
+    memcpy(&bits, &val, sizeof bits);
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((bits >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = bits & 0x007FFFFFu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x00800000u;
+        int32_t rshift = 14 - exp;
+        uint32_t h = mant >> rshift;
+        uint32_t rem = mant & ((1u << rshift) - 1u);
+        uint32_t half_way = 1u << (rshift - 1);
+        if (rem > half_way || (rem == half_way && (h & 1u))) h++;
+        return (uint16_t)(sign | h);
+    }
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    uint32_t h = ((uint32_t)exp << 10) | (mant >> 13);
+    if ((mant & 0x00001FFFu) > 0x00001000u || ((mant & 0x00001FFFu) == 0x00001000u && (h & 1u))) {
+        h++;
+    }
+    return (uint16_t)(sign | h);
+}
+
+__attribute__((unused)) static float half_to_float_bits(uint16_t h) {
+    uint32_t sign = ((uint32_t)(h & 0x8000u)) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x03FFu;
+    uint32_t bits = 0;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FFu;
+            bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out = 0.0f;
+    memcpy(&out, &bits, sizeof out);
+    return out;
+}
+
+static int fmt_channels(unsigned fmt) {
+    switch (fmt) {
+        case C_RED:  return 1;
+        case C_RG:   return 2;
+        case C_RGB:  return 3;
+        case C_RGBA: return 4;
+    }
+    return 4;
+}
+
+static float sample_norm16_val(const unsigned char* p, unsigned type) {
+    if (type == C_USHORT) {
+        uint16_t u = 0;
+        memcpy(&u, p, sizeof u);
+        return (float)u / 65535.0f;
+    }
+    int16_t s = 0;
+    memcpy(&s, p, sizeof s);
+    float v = (float)s / 32767.0f;
+    return v < -1.0f ? -1.0f : v;
+}
+
+/* Convert 2D or 3D norm16 pixel data respecting UNPACK_* parameters; returns NULL if PBO is bound */
+static void* convert_unpack_pixels(const void* src, int w, int h, int d,
+                                  unsigned fmt, unsigned type, unsigned* out_type,
+                                  unpack_state* saved_st) {
+    int pbo = 0;
+    real_glGetIntegerv(C_PIXEL_UNPACK_BUFFER, &pbo);
+    if (pbo) {
+        if (gles_debug_enabled())
+            fprintf(stderr, "[gles-shim] norm16 PBO active (id=%d), skipping CPU conversion\n", pbo);
+        return NULL;
+    }
+
+    int al = 4, rl = 0, sp = 0, sr = 0;
+    real_glGetIntegerv(C_UNPACK_ALIGNMENT, &al);
+    real_glGetIntegerv(C_UNPACK_ROW_LENGTH, &rl);
+    real_glGetIntegerv(C_UNPACK_SKIP_PIXELS, &sp);
+    real_glGetIntegerv(C_UNPACK_SKIP_ROWS, &sr);
+    if (al <= 0) al = 4;
+
+    if (saved_st) {
+        saved_st->align = al;
+        saved_st->row_len = rl;
+        saved_st->skip_px = sp;
+        saved_st->skip_rows = sr;
+    }
+
+    if (!src || w <= 0 || h <= 0 || d <= 0) return NULL;
+
+    int ch = fmt_channels(fmt);
+    size_t elem_sz = 2;
+    size_t row_px = (size_t)(rl > 0 ? rl : w);
+    size_t row_bytes = (row_px * (size_t)ch * elem_sz + (size_t)al - 1u) / (size_t)al * (size_t)al;
+    /* base already skips sr rows, so each 2D slice is row_bytes * h */
+    size_t slice_bytes = row_bytes * (size_t)h;
+    const unsigned char* base = (const unsigned char*)src + (size_t)sr * row_bytes + (size_t)sp * (size_t)ch * elem_sz;
+
+    size_t total_elems = (size_t)w * (size_t)h * (size_t)d * (size_t)ch;
+    int use_half = norm16_use_half();
+
+    if (use_half) {
+        uint16_t* out = malloc(total_elems * sizeof(uint16_t));
+        if (!out) return NULL;
+        for (int z = 0; z < d; z++) {
+            const unsigned char* z_ptr = base + (size_t)z * slice_bytes;
+            for (int y = 0; y < h; y++) {
+                const unsigned char* r_ptr = z_ptr + (size_t)y * row_bytes;
+                for (int x = 0; x < w * ch; x++) {
+                    float f = sample_norm16_val(r_ptr + (size_t)x * elem_sz, type);
+                    out[((size_t)z * (size_t)h + (size_t)y) * (size_t)w * (size_t)ch + (size_t)x] =
+                        float_to_half_bits(f);
+                }
+            }
+        }
+        *out_type = C_HALF_FLOAT;
+        return out;
+    }
+
+    float* out = malloc(total_elems * sizeof(float));
+    if (!out) return NULL;
+    for (int z = 0; z < d; z++) {
+        const unsigned char* z_ptr = base + (size_t)z * slice_bytes;
+        for (int y = 0; y < h; y++) {
+            const unsigned char* r_ptr = z_ptr + (size_t)y * row_bytes;
+            for (int x = 0; x < w * ch; x++) {
+                out[((size_t)z * (size_t)h + (size_t)y) * (size_t)w * (size_t)ch + (size_t)x] =
+                    sample_norm16_val(r_ptr + (size_t)x * elem_sz, type);
+            }
+        }
+    }
+    *out_type = C_FLOAT;
+    return out;
+}
+
+static void set_tight_unpack(void) {
+    if (!real_glPixelStorei) return;
+    real_glPixelStorei(C_UNPACK_ROW_LENGTH, 0);
+    real_glPixelStorei(C_UNPACK_SKIP_PIXELS, 0);
+    real_glPixelStorei(C_UNPACK_SKIP_ROWS, 0);
+    real_glPixelStorei(C_UNPACK_ALIGNMENT, 4);
+}
+
+static void restore_unpack(const unpack_state* st) {
+    if (!real_glPixelStorei || !st) return;
+    real_glPixelStorei(C_UNPACK_ROW_LENGTH, st->row_len);
+    real_glPixelStorei(C_UNPACK_SKIP_PIXELS, st->skip_px);
+    real_glPixelStorei(C_UNPACK_SKIP_ROWS, st->skip_rows);
+    real_glPixelStorei(C_UNPACK_ALIGNMENT, st->align);
+}
+
+static unsigned remap_norm16_ifmt(unsigned f) {
+    unsigned e = emu_ifmt(f);
+    return (e && norm16_emulated()) ? e : f;
+}
+
+EXPORT void glTexStorage2D(unsigned tgt, int levels, unsigned ifmt, int w, int h) {
+    if (real_glTexStorage2D) real_glTexStorage2D(tgt, levels, remap_norm16_ifmt(ifmt), w, h);
+}
+
+EXPORT void glTexStorage3D(unsigned tgt, int levels, unsigned ifmt, int w, int h, int d) {
+    if (real_glTexStorage3D) real_glTexStorage3D(tgt, levels, remap_norm16_ifmt(ifmt), w, h, d);
+}
+
+EXPORT void glRenderbufferStorage(unsigned tgt, unsigned ifmt, int w, int h) {
+    if (real_glRenderbufferStorage) real_glRenderbufferStorage(tgt, remap_norm16_ifmt(ifmt), w, h);
+}
+
+EXPORT void glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
+                         int b, unsigned fmt, unsigned type, const void* px) {
+    if (!real_glTexImage2D) return;
+    unsigned e = emu_ifmt((unsigned)ifmt);
+    if (e && norm16_emulated()) {
+        int pbo = 0;
+        real_glGetIntegerv(C_PIXEL_UNPACK_BUFFER, &pbo);
+        if (pbo) {
+            if (gles_debug_enabled())
+                fprintf(stderr, "[gles-shim] glTexImage2D norm16 with PBO (id=%d) passed with NULL data\n", pbo);
+            real_glTexImage2D(tgt, lvl, (int)e, w, h, b, fmt, norm16_use_half() ? C_HALF_FLOAT : C_FLOAT, NULL);
+            return;
+        }
+        unpack_state st = { 4, 0, 0, 0 };
+        unsigned out_type = C_FLOAT;
+        void* conv = px ? convert_unpack_pixels(px, w, h, 1, fmt, type, &out_type, &st) : NULL;
+        /* Only touch UNPACK_* state when a converted buffer was actually produced */
+        if (conv) set_tight_unpack();
+        real_glTexImage2D(tgt, lvl, (int)e, w, h, b, fmt, conv ? out_type : C_FLOAT, conv);
+        if (conv) restore_unpack(&st);
+        free(conv);
+        return;
+    }
+    real_glTexImage2D(tgt, lvl, ifmt, w, h, b, fmt, type, px);
+}
+
+EXPORT void glTexSubImage2D(unsigned tgt, int lvl, int xoff, int yoff, int w, int h,
+                            unsigned fmt, unsigned type, const void* px) {
+    if (!real_glTexSubImage2D) return;
+    if ((type == C_USHORT || type == C_SHORT) &&
+        (fmt == C_RED || fmt == C_RG || fmt == C_RGB || fmt == C_RGBA) &&
+        norm16_emulated()) {
+        int pbo = 0;
+        real_glGetIntegerv(C_PIXEL_UNPACK_BUFFER, &pbo);
+        if (pbo) {
+            if (gles_debug_enabled())
+                fprintf(stderr, "[gles-shim] glTexSubImage2D norm16 with PBO (id=%d) skipped\n", pbo);
+            return;
+        }
+        unpack_state st = { 4, 0, 0, 0 };
+        unsigned out_type = C_FLOAT;
+        void* conv = px ? convert_unpack_pixels(px, w, h, 1, fmt, type, &out_type, &st) : NULL;
+        if (conv) set_tight_unpack();
+        real_glTexSubImage2D(tgt, lvl, xoff, yoff, w, h, fmt, conv ? out_type : C_FLOAT, conv);
+        if (conv) restore_unpack(&st);
+        free(conv);
+        return;
+    }
+    real_glTexSubImage2D(tgt, lvl, xoff, yoff, w, h, fmt, type, px);
+}
+
+EXPORT void glTexImage3D(unsigned tgt, int lvl, int ifmt, int w, int h, int d,
+                         int b, unsigned fmt, unsigned type, const void* px) {
+    if (!real_glTexImage3D) return;
+    unsigned e = emu_ifmt((unsigned)ifmt);
+    if (e && norm16_emulated()) {
+        int pbo = 0;
+        real_glGetIntegerv(C_PIXEL_UNPACK_BUFFER, &pbo);
+        if (pbo) {
+            if (gles_debug_enabled())
+                fprintf(stderr, "[gles-shim] glTexImage3D norm16 with PBO (id=%d) passed with NULL data\n", pbo);
+            real_glTexImage3D(tgt, lvl, (int)e, w, h, d, b, fmt, norm16_use_half() ? C_HALF_FLOAT : C_FLOAT, NULL);
+            return;
+        }
+        unpack_state st = { 4, 0, 0, 0 };
+        unsigned out_type = C_FLOAT;
+        void* conv = px ? convert_unpack_pixels(px, w, h, d, fmt, type, &out_type, &st) : NULL;
+        if (conv) set_tight_unpack();
+        real_glTexImage3D(tgt, lvl, (int)e, w, h, d, b, fmt, conv ? out_type : C_FLOAT, conv);
+        if (conv) restore_unpack(&st);
+        free(conv);
+        return;
+    }
+    real_glTexImage3D(tgt, lvl, ifmt, w, h, d, b, fmt, type, px);
+}
+
+EXPORT void glTexSubImage3D(unsigned tgt, int lvl, int xoff, int yoff, int zoff,
+                            int w, int h, int d, unsigned fmt, unsigned type, const void* px) {
+    if (!real_glTexSubImage3D) return;
+    if ((type == C_USHORT || type == C_SHORT) &&
+        (fmt == C_RED || fmt == C_RG || fmt == C_RGB || fmt == C_RGBA) &&
+        norm16_emulated()) {
+        int pbo = 0;
+        real_glGetIntegerv(C_PIXEL_UNPACK_BUFFER, &pbo);
+        if (pbo) {
+            if (gles_debug_enabled())
+                fprintf(stderr, "[gles-shim] glTexSubImage3D norm16 with PBO (id=%d) skipped\n", pbo);
+            return;
+        }
+        unpack_state st = { 4, 0, 0, 0 };
+        unsigned out_type = C_FLOAT;
+        void* conv = px ? convert_unpack_pixels(px, w, h, d, fmt, type, &out_type, &st) : NULL;
+        if (conv) set_tight_unpack();
+        real_glTexSubImage3D(tgt, lvl, xoff, yoff, zoff, w, h, d, fmt, conv ? out_type : C_FLOAT, conv);
+        if (conv) restore_unpack(&st);
+        free(conv);
+        return;
+    }
+    real_glTexSubImage3D(tgt, lvl, xoff, yoff, zoff, w, h, d, fmt, type, px);
+}
+
+/* Check whether current read framebuffer color attachment 0 uses a half/float internal format */
+static int read_fb_is_fp(void) {
+    typedef void (*PFN_GET_FB_ATT_IV)(unsigned, unsigned, unsigned, int*);
+    typedef void (*PFN_GET_TEX_LVL_IV)(unsigned, int, unsigned, int*);
+    typedef void (*PFN_GET_RB_IV)(unsigned, unsigned, int*);
+    static PFN_GET_FB_ATT_IV p_get_fb_att = NULL;
+    static PFN_GET_TEX_LVL_IV p_get_tex_lvl = NULL;
+    static PFN_GET_RB_IV p_get_rb = NULL;
+    if (!p_get_fb_att) p_get_fb_att = (PFN_GET_FB_ATT_IV)glp("glGetFramebufferAttachmentParameteriv");
+    if (!p_get_tex_lvl) p_get_tex_lvl = (PFN_GET_TEX_LVL_IV)glp("glGetTexLevelParameteriv");
+    if (!p_get_rb) p_get_rb = (PFN_GET_RB_IV)glp("glGetRenderbufferParameteriv");
+    if (!p_get_fb_att) return 0;
+
+    int fb = 0;
+    real_glGetIntegerv(C_READ_FB_BINDING_EXT, &fb);
+    if (fb == 0) return 0; /* Default framebuffer is not a float/half emulated FBO */
+
+    int obj_type = 0, obj_name = 0, ifmt = 0;
+    p_get_fb_att(C_READ_FB, C_COLOR_ATT0_EXT, C_FB_ATT_OBJ_TYPE, &obj_type);
+    p_get_fb_att(C_READ_FB, C_COLOR_ATT0_EXT, C_FB_ATT_OBJ_NAME, &obj_name);
+
+    if (obj_type == C_TEXTURE_CONST && obj_name > 0 && p_get_tex_lvl) {
+        int prev_tex = 0;
+        real_glGetIntegerv(C_TEX_BINDING_2D, &prev_tex);
+        GL.bindTexture(C_TEXTURE_2D, (unsigned)obj_name);
+        p_get_tex_lvl(C_TEXTURE_2D, 0, C_TEX_INT_FMT, &ifmt);
+        GL.bindTexture(C_TEXTURE_2D, prev_tex);
+    } else if (obj_type == C_RENDERBUFFER_CONST && obj_name > 0 && p_get_rb) {
+        int prev_rb = 0;
+        real_glGetIntegerv(C_RB_BINDING, &prev_rb);
+        GL.bindRenderbuffer(C_RENDERBUFFER, (unsigned)obj_name);
+        p_get_rb(C_RENDERBUFFER, C_RB_INT_FMT, &ifmt);
+        GL.bindRenderbuffer(C_RENDERBUFFER, prev_rb);
+    }
+
+    return (ifmt == (int)C_R16F || ifmt == (int)C_RG16F || ifmt == (int)C_RGB16F || ifmt == (int)C_RGBA16F ||
+            ifmt == (int)C_R32F || ifmt == (int)C_RG32F || ifmt == (int)C_RGB32F || ifmt == (int)C_RGBA32F);
+}
+
+EXPORT void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void* data) {
+    if (!real_glReadPixels) return;
+    if ((type == C_USHORT || type == C_SHORT) && norm16_emulated() && data && w > 0 && h > 0) {
+        int pbo = 0;
+        real_glGetIntegerv(C_PIXEL_PACK_BUFFER, &pbo);
+        if (!pbo && read_fb_is_fp()) {
+            int ch = fmt_channels(fmt);
+            size_t count = (size_t)w * (size_t)h * (size_t)ch;
+            float* tmp = malloc(count * sizeof(float));
+            if (tmp) {
+                real_glReadPixels(x, y, w, h, fmt, C_FLOAT, tmp);
+                if (type == C_USHORT) {
+                    uint16_t* dst = (uint16_t*)data;
+                    for (size_t i = 0; i < count; i++) {
+                        float v = tmp[i];
+                        if (v <= 0.0f) dst[i] = 0;
+                        else if (v >= 1.0f) dst[i] = 65535;
+                        else dst[i] = (uint16_t)(v * 65535.0f + 0.5f);
+                    }
+                } else {
+                    int16_t* dst = (int16_t*)data;
+                    for (size_t i = 0; i < count; i++) {
+                        float v = tmp[i];
+                        if (v <= -1.0f) dst[i] = -32767;
+                        else if (v >= 1.0f) dst[i] = 32767;
+                        else dst[i] = (int16_t)(v * 32767.0f + (v >= 0.0f ? 0.5f : -0.5f));
+                    }
+                }
+                free(tmp);
+                return;
+            }
+        }
+    }
+    real_glReadPixels(x, y, w, h, fmt, type, data);
+}
+
+EXPORT const unsigned char* glGetString(unsigned name) {
+    if (!real_glGetString) return NULL;
+    if (name == C_GL_EXTENSIONS && norm16_needed()) {
+        static char* buf;
+        if (!buf) {
+            const char* base = (const char*)real_glGetString(name);
+            size_t len = (base ? strlen(base) : 0) + strlen(NORM16_EXT) + 2;
+            buf = malloc(len);
+            if (!buf) return real_glGetString(name);
+            snprintf(buf, len, "%s%s%s", base ? base : "", (base && *base) ? " " : "", NORM16_EXT);
+        }
+        return (const unsigned char*)buf;
+    }
+    return real_glGetString(name);
+}
+
+EXPORT const unsigned char* glGetStringi(unsigned name, unsigned idx) {
+    if (!real_glGetStringi) return NULL;
+    if (name == C_GL_EXTENSIONS && norm16_needed()) {
+        int n = 0; real_glGetIntegerv(C_NUM_EXTENSIONS, &n);
+        if ((int)idx == n) return (const unsigned char*)NORM16_EXT;
+    }
+    return real_glGetStringi(name, idx);
+}
+
+EXPORT void glGetIntegerv(unsigned pname, int* v) {
+    if (!real_glGetIntegerv) return;
+    real_glGetIntegerv(pname, v);
+    if (pname == C_NUM_EXTENSIONS && v && norm16_needed()) (*v)++;
+}
+#endif /* GLX_SHIM_BUILD */

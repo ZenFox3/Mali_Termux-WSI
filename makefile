@@ -140,11 +140,11 @@ GL_DEPS       := $(wildcard $(GL_DIR)/Scripts/*) $(wildcard $(GL_DIR)/Include/*)
 GL_CFLAGS     := -I$(GL_DIR)/Include -I$(GL_DIR)/Scripts \
                  -I$(GLES_DIR)/Scripts -I$(GLES_DIR)/Include -IAPI/EGL/Include \
                  -Isrc/bcdec -I$(PREFIX)/include \
-                 -Wno-unused-function -Wno-misleading-indentation
+                 -Wno-unused-function -Wno-misleading-indentation -DGLX_SHIM_BUILD
 GL_CXXFLAGS   := -std=c++17 -fvisibility=hidden -I$(GL_DIR)/Include \
                  -Wno-unused-function -Wno-unused-variable
 # SPV_LIBS comes before -lc++: the SPIRV-Cross archives need libc++ symbols
-GL_LIBS       := -lxcb -lxcb-dri3 -lxcb-present -lEGL $(SPV_LIBS) -ldl -lpthread -lm -lc++
+GL_LIBS       := -lxcb -lxcb-dri3 -lxcb-present -lEGL $(SPV_LIBS) -ldl -lpthread -lm -lc++ 
 
 # ---- OpenCL ----
 CL_DIR      := API/CL

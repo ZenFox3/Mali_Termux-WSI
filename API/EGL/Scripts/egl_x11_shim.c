@@ -66,6 +66,7 @@
 #define EGL_PLATFORM_WAYLAND_KHR      0x31D8
 #define EGL_PLATFORM_DEVICE_EXT       0x313F
 #define EGL_DEVICE_EXT                0x322C
+#define EGL_PLATFORM_ANDROID_KHR      0x3141
 #define EGL_RENDERER_EXT              0x335F
 #define EGL_DRM_DEVICE_FILE_EXT        0x3233
 #define EGL_DRM_RENDER_NODE_FILE_EXT   0x3377
@@ -1811,7 +1812,32 @@ EXPORT int eglGetError(void) {
     return f ? f() : E_SUCCESS;
 }
 
+static __thread int T_internal;
+EXPORT void shim_egl_internal(int on) { T_internal = on; }
+
+static int api_mode_env(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("EGL_API");
+        v = 0;
+        if (e) {
+            if (!strcasecmp(e, "GL") || !strcasecmp(e, "OPENGL")) v = 1;
+            else if (!strcasecmp(e, "GL_ES") || !strcasecmp(e, "GLES") ||
+                     !strcasecmp(e, "OPENGL_ES")) v = 2;
+        }
+    }
+    return v;
+}
+
+static __thread int T_gles_only;
+static int api_mode(void) {
+    if (T_internal) return 0;
+    if (T_gles_only) return 2;
+    return api_mode_env();
+}
+
 EXPORT void* eglGetDisplay(void* native) {
+    T_gles_only = 0;
             if (getenv("SHIM_WAYLAND") || wl_wsi_is_wl_display(native)) return shim_wl_display(native);
     if (getenv("SHIM_GBM")) return gbm_display(native);
     return shim_display(native, -1, 0);
@@ -1825,6 +1851,10 @@ static void* surfaceless_display(void* native) {
     if (!d) SET_ERR(E_BAD_DISPLAY);
     DBG("[shim] surfaceless platform display %p\n", d);
     return d;
+}
+
+static void* android_display(void* native) {
+    return surfaceless_display(native);
 }
 
 static int track_refs_check(const intptr_t* at, int* other) {
@@ -1850,11 +1880,13 @@ static void* device_display(void* native, int has_attribs) {
 }
 
 static void* platform_display(unsigned platform, void* native, int scr) {
+    T_gles_only = (platform == EGL_PLATFORM_ANDROID_KHR);
     if (platform == EGL_PLATFORM_WAYLAND_KHR) return shim_wl_display(native);
     if (platform == EGL_PLATFORM_GBM_KHR) return gbm_display(native);
     if (platform == EGL_PLATFORM_SURFACELESS_MESA) return surfaceless_display(native);
     if (platform == EGL_PLATFORM_ANGLE_ANGLE)
         return shim_display(native, scr, 0); 
+  if (platform == EGL_PLATFORM_ANDROID_KHR) return android_display(native);
     if (platform != EGL_PLATFORM_X11_EXT && platform != EGL_PLATFORM_XCB_EXT) {
         SET_ERR(E_BAD_PARAMETER); return NULL;
     }
@@ -1882,6 +1914,7 @@ EXPORT void* eglGetPlatformDisplayEXT(unsigned platform, void* native, const int
 }
 
 EXPORT void* eglGetPlatformDisplay(unsigned platform, void* native, const intptr_t* at) {
+  T_gles_only = 0;
     int other;
     DBG("[shim] getPlatformDisplay platform=0x%x native=%p\n", platform, native);
     for (const intptr_t* a = at; a && *a != E_NONE; a += 2)
@@ -1909,23 +1942,7 @@ static int want_es1(void) {
     return v;
 }
 
-static __thread int T_internal;
-EXPORT void shim_egl_internal(int on) { T_internal = on; }
 
-static int api_mode_env(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("EGL_API");
-        v = 0;
-        if (e) {
-            if (!strcasecmp(e, "GL") || !strcasecmp(e, "OPENGL")) v = 1;
-            else if (!strcasecmp(e, "GL_ES") || !strcasecmp(e, "GLES") ||
-                     !strcasecmp(e, "OPENGL_ES")) v = 2;
-        }
-    }
-    return v;
-}
-static int api_mode(void) { return T_internal ? 0 : api_mode_env(); }
 
 /* GL API is active: explicit bind or GL-only mode (where ES is disabled) */
 static inline int gl_api_active(void) { return g_gl_mapped || api_mode() == 1; }
@@ -2492,7 +2509,7 @@ static const char CLIENT_EXTS[] =
     "EGL_MESA_platform_surfaceless "
     "EGL_KHR_platform_gbm EGL_MESA_platform_gbm EGL_EXT_device_query EGL_KHR_display_reference "
     "EGL_EXT_device_enumeration EGL_EXT_device_base EGL_EXT_platform_device EGL_ANGLE_platform_angle "
-    "EGL_KHR_client_get_all_proc_addresses EGL_EXT_query_reset_notification_strategy EGL_KHR_debug EGL_EXT_explicit_device ";
+    "EGL_KHR_client_get_all_proc_addresses EGL_EXT_query_reset_notification_strategy EGL_KHR_debug EGL_EXT_explicit_device EGL_KHR_platform_android ";
 
 static const char* const CLIENT_LIST[] = {
     "EGL_EXT_client_extensions", "EGL_EXT_platform_base", "EGL_EXT_platform_x11",
@@ -2500,7 +2517,7 @@ static const char* const CLIENT_LIST[] = {
     "EGL_KHR_platform_wayland", "EGL_MESA_platform_surfaceless",
     "EGL_KHR_platform_gbm", "EGL_MESA_platform_gbm", "EGL_EXT_device_query",
     "EGL_EXT_device_enumeration", "EGL_EXT_device_base", "EGL_EXT_platform_device", "EGL_KHR_display_reference",
-    "EGL_KHR_client_get_all_proc_addresses", "EGL_EXT_query_reset_notification_strategy", "EGL_ANGLE_platform_angle", "EGL_KHR_debug", "EGL_EXT_explicit_device",
+    "EGL_KHR_client_get_all_proc_addresses", "EGL_EXT_query_reset_notification_strategy", "EGL_ANGLE_platform_angle", "EGL_KHR_debug", "EGL_EXT_explicit_device", "EGL_KHR_platform_android",
 };
 
 static int has_token(const char* s, const char* t) {

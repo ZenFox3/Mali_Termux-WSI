@@ -1029,8 +1029,12 @@ static VkResult VKAPI_CALL wsi_CreateWaylandSurfaceKHR(VkInstance i,
 
 static VkBool32 VKAPI_CALL wsi_GetWaylandPresentationSupportKHR(VkPhysicalDevice pd,
         uint32_t qf, struct wl_display* d) {
-    (void)pd; (void)qf; (void)d;
-    return VK_TRUE;
+    (void)d;
+    VkBool32 sup = VK_FALSE;
+    wsi_GetPDSurfaceSupportKHR(pd, qf, VK_NULL_HANDLE, &sup);
+    if (wsi_dbg_enabled())
+        fprintf(stderr, "vulkan_debug: WaylandPresentationSupport qf=%u -> %d\n", qf, (int)sup);
+    return sup;
 }
 
 /* Dispatch only the private Wayland queue: 1 = progress, 0 = timeout, -1 = error */
@@ -2578,6 +2582,10 @@ static PFN_vkVoidFunction VKAPI_CALL wsi_gipa(VkInstance i, const char* n) {
     if (!strcmp(n, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)wsi_gipa;
     if (!strcmp(n, "vkCreateInstance"))      return (PFN_vkVoidFunction)wsi_CreateInstance;
     if (!strcmp(n, "vkCreateDevice"))        return (PFN_vkVoidFunction)wsi_CreateDevice;
+
+    PFN_vkVoidFunction own = wsi_lookup(wsi_inst_ov, n);
+    if (own) return own;
+
     if (g_nly && i) { PFN_vkVoidFunction f = g_ly[0].gipa(i, n); if (f) return f; }
     return wsi_core_gipa(i, n);
 }
@@ -2635,7 +2643,6 @@ static int wsi_load(mali_ctx* c) {
 
     wsi_dh_init();
     if (g_dh.on) g_zc_ok = 1;
-
     if (wsi_dbg_enabled()) {
         fprintf(stderr, "vulkan_debug: zero-copy available = %d\n", g_zc_ok);
     }
